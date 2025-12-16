@@ -14,19 +14,11 @@ use tokio::time::sleep;
 // use tower::limit::ConcurrencyLimitLayer;
 use types::UserId;
 
-#[derive(Debug)]
-enum Data {
-    Init,
-    // Tuple of UserId, msg
-    DirectMessage(UserId, String),
-
-    MsgRequestId(MsgRequestId),
-}
-
 // TODO: organize the data into purpose.  ie dm messages will go into DataCache::dms and ledger data will go into DataCache::ledger
 // I can get rid of enum Data at this point and just store a vector of structs with info for each data type
 struct DataCache {
-    data: Vec<Data>,
+    dm_data: Vec<DirectMessage>,
+    msg_link_data: Vec<MsgLink>,
 }
 
 // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
@@ -40,32 +32,38 @@ mod api {
         async fn dm(&self, msg: DirectMessage) -> RpcResult<()>;
 
         #[method(name = "msg")]
-        async fn msg(&self, msg: MsgRequestId) -> RpcResult<()>;
+        async fn msg(&self, msg: MsgLink) -> RpcResult<()>;
         // #[method(name = "msg_reply")]
         // async fn msg_reply(&self, msg: MsgRequestId) -> RpcResult<()>;
     }
 
     pub struct RpcServerImpl {
-        notifier: watch::Sender<()>,
+        dm_data_notifier: watch::Sender<()>,
+        msg_link_notifier: watch::Sender<()>,
         cache: Arc<Mutex<DataCache>>,
-        pub iface: Option<Arc<Interface>>,
+        iface: Arc<Interface>,
     }
     impl RpcServerImpl {
         pub fn new(
-            notifier: watch::Sender<()>,
+            dm_data_notifier: watch::Sender<()>,
+            msg_link_notifier: watch::Sender<()>,
             cache: Arc<Mutex<DataCache>>,
-            iface: Option<Arc<Interface>>,
+            iface: Arc<Interface>,
         ) -> Self {
             RpcServerImpl {
-                notifier,
+                dm_data_notifier,
+                msg_link_notifier,
                 cache,
                 iface,
             }
         }
-        /// Add data to relevant field on the ServerImpl and send notification
-        async fn add_data(&self, data: Data) {
-            self.cache.lock().await.data.push(data);
-            self.notifier.send(()).unwrap();
+        async fn add_dm_data(&self, dm_data: DirectMessage) {
+            self.cache.lock().await.dm_data.push(dm_data);
+            self.dm_data_notifier.send(()).unwrap();
+        }
+        async fn add_msg_link_data(&self, data: MsgLink) {
+            self.cache.lock().await.msg_link_data.push(data);
+            self.dm_data_notifier.send(()).unwrap();
         }
     }
 
@@ -75,13 +73,16 @@ mod api {
             Ok(format!("pong"))
         }
         async fn dm(&self, dm: DirectMessage) -> RpcResult<()> {
-            let data = Data::DirectMessage(dm.sender, dm.msg.to_string());
-            self.add_data(data).await;
+            let data = DirectMessage::new(dm.sender, dm.msg.as_str());
+            self.add_dm_data(data).await;
             Ok(())
         }
-        async fn msg(&self, msg: MsgRequestId) -> RpcResult<()> {
-            let data = Data::MsgRequestId(msg);
-            self.add_data(data).await;
+
+        async fn msg(&self, msg: MsgLink) -> RpcResult<()> {
+            self.add_msg_link_data(msg).await;
+            // notify?
+            // do i need to send out an init
+
             // self.iface.unwrap().reply_msg(rcvr, msg);
             Ok(())
         }
@@ -103,13 +104,13 @@ mod api {
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug)]
-    pub struct MsgRequestId {
+    pub struct MsgLink {
         sender: UserId,
-        req_id: RequestId,
+        req_id: MsgLinkId,
         data: String,
     }
-    impl MsgRequestId {
-        pub fn new(sender: UserId, req_id: RequestId, data: String) -> Self {
+    impl MsgLink {
+        pub fn new(sender: UserId, req_id: MsgLinkId, data: String) -> Self {
             Self {
                 sender,
                 req_id,
@@ -121,52 +122,41 @@ mod api {
 
 use api::{MyRpcClient, MyRpcServer, RpcServerImpl};
 
-use crate::api::{DirectMessage, MsgRequestId};
+use crate::api::{DirectMessage, MsgLink};
 
 #[derive(PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct RequestId(u64);
-impl RequestId {
+struct MsgLinkId(u64);
+impl MsgLinkId {
     pub fn new() -> Self {
         Self(rand::Rng::random(&mut rand::rng()))
     }
 }
 
+struct Notifiees {
+    dm_notifee: watch::Receiver<()>,
+    msg_link_notifee: watch::Receiver<()>,
+}
 pub struct Interface {
     /// My IpAddr
     _addr: SocketAddr,
     /// TODO: My PubKey
     pubkey: UserId,
-    /// Watch channel thats updates when new items are received over the network
-    new_data_notifee: watch::Receiver<()>,
-    /// Data from the network
-    cache: Arc<Mutex<DataCache>>,
     /// Maps a UserId to their addr
-    addr_book: HashMap<UserId, SocketAddr>,
+    addr_book: Arc<Mutex<HashMap<UserId, SocketAddr>>>,
     /// Stores clients so I don't have to recreate them for each outgoing connection
-    clients: HashMap<SocketAddr, Arc<HttpClient>>,
+    clients: Arc<Mutex<HashMap<SocketAddr, Arc<HttpClient>>>>,
     /// Active RPC requests that are waiting for a reply value
-    pending_dm_replies: HashMap<RequestId, oneshot::Sender<MsgRequestId>>,
+    pending_dm_replies: HashMap<MsgLinkId, oneshot::Sender<MsgLink>>,
+    /// Watch channels receivers subscribed to new network data
+    notifees: Notifiees,
+    cache: Arc<Mutex<DataCache>>,
 }
 impl Interface {
-    fn new(
-        _addr: SocketAddr,
-        new_data_notifee: watch::Receiver<()>,
-        cache: Arc<Mutex<DataCache>>,
-    ) -> Self {
-        Self {
-            _addr,
-            addr_book: HashMap::new(),
-            pubkey: UserId::new(),
-            new_data_notifee,
-            cache,
-            clients: HashMap::new(),
-            pending_dm_replies: HashMap::new(),
-        }
-    }
-    pub async fn start() -> Arc<Self> {
-        let (sndr, rcvr) = watch::channel(());
-        let cache: Arc<Mutex<DataCache>> = Arc::new(Mutex::new(DataCache { data: Vec::new() }));
-        let mut server_impl = RpcServerImpl::new(sndr, cache.clone(), None);
+    pub async fn new() -> Arc<Self> {
+        let cache: Arc<Mutex<DataCache>> = Arc::new(Mutex::new(DataCache {
+            dm_data: Vec::new(),
+            msg_link_data: Vec::new(),
+        }));
         let server = ServerBuilder::default()
             // TODO vvv
             // .set_http_middleware(tower::ServiceBuilder::new()
@@ -177,8 +167,22 @@ impl Interface {
             .await
             .unwrap();
         let addr = server.local_addr().unwrap();
-        let iface = Arc::new(Interface::new(addr, rcvr, cache));
-        server_impl.iface = Some(iface.clone());
+        let (sndr, dm_notifee) = watch::channel(());
+        let (sndr_msg_link, msg_link_notifee) = watch::channel(());
+        let notifees = Notifiees {
+            dm_notifee,
+            msg_link_notifee,
+        };
+        let iface = Arc::new(Interface {
+            _addr: addr,
+            addr_book: Arc::new(Mutex::new(HashMap::new())),
+            pubkey: UserId::new(),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            pending_dm_replies: HashMap::new(),
+            notifees,
+            cache: cache.clone(),
+        });
+        let server_impl = RpcServerImpl::new(sndr, sndr_msg_link, cache, iface.clone());
         // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
         let server_handle = server.start(server_impl.into_rpc());
 
@@ -186,7 +190,7 @@ impl Interface {
 
         iface
     }
-    pub async fn send_dm(&mut self, rcvr: &UserId, msg: &str) {
+    pub async fn send_dm(&self, rcvr: &UserId, msg: &str) {
         let client = self.connect(rcvr).await;
         let dm = DirectMessage::new(self.pubkey, msg);
         client.dm(dm).await.unwrap();
@@ -197,30 +201,32 @@ impl Interface {
         let client = self.connect(rcvr).await;
 
         // Create oneshot channel to receive the reply
-        let (tx, rx) = oneshot::channel::<MsgRequestId>();
-        let req_id = RequestId::new();
+        let (tx, rx) = oneshot::channel::<MsgLink>();
+        let req_id = MsgLinkId::new();
         self.pending_dm_replies.insert(req_id.clone(), tx);
 
         // send dm
         println!("sending msg");
-        let data = MsgRequestId::new(self.pubkey, req_id, "expecting a reply".to_string());
-        client.msg(data).await.unwrap();
+        let data = MsgLink::new(self.pubkey, req_id, msg.to_string());
+        // client.msg(data).await.unwrap();
 
         // wait for reply
         let reply = rx.await.unwrap();
         println!("i got this reply {:?}", reply);
     }
 
-    pub async fn connect(&mut self, rcvr: &UserId) -> Arc<HttpClient> {
-        let addr = self.addr_book.get(rcvr).unwrap();
-        let client = self.clients.entry(*addr).or_insert_with(|| {
+    pub async fn connect(&self, rcvr: &UserId) -> Arc<HttpClient> {
+        let addr_book = self.addr_book.lock().await;
+        let addr = addr_book.get(rcvr).unwrap();
+        let mut clients = self.clients.lock().await;
+        let client = clients.entry(*addr).or_insert_with(|| {
             let server_url = format!("http://{}", addr);
             Arc::new(HttpClientBuilder::default().build(&server_url).unwrap())
         });
         client.clone()
     }
-    pub async fn add_addr_book(&mut self, id: UserId, addr: SocketAddr) {
-        self.addr_book.insert(id, addr);
+    pub async fn add_addr_book(&self, id: UserId, addr: SocketAddr) {
+        self.addr_book.lock().await.insert(id, addr);
     }
 }
 
@@ -234,35 +240,57 @@ mod tests {
 
     #[tokio::test]
     async fn interface_test() {
-        let mut iface = Interface::start().await;
+        let iface = Interface::new().await;
         let addr = iface._addr;
-        let mut notifee = iface.new_data_notifee.clone();
-        let cache = iface.cache.clone();
         let id = iface.pubkey;
 
-        let mut iface2 = Interface::start().await;
-        let addr2 = iface2._addr;
-        let id2 = iface2.pubkey;
-
-        // create address book with both of their entries in it
-        // iface.add_addr_book(id2, addr2).await;
-        // iface2.add_addr_book(id, addr).await;
-
-        // spawn task to print iface1 incoming data
+        let mut dm_notifee = iface.notifees.dm_notifee.clone();
         tokio::task::spawn(async move {
-            notifee.changed().await.unwrap();
-            let x = cache.lock().await.data.pop().unwrap();
-            println!("{x:?}");
-        });
-        // spawn task to send a message and wait for a reply
-        tokio::task::spawn(async move {
-            // iface2.send_dm_wait_reply(&id, "u r dumb").await;
+            loop {
+                dm_notifee.changed().await.unwrap();
+                println!("receved {:?}", iface.cache.lock().await.dm_data.pop());
+            }
         });
 
-        // iface.send_dm(&id2, "no u").await;
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let iface2 = Interface::new().await;
+        iface2.add_addr_book(id, addr).await;
+        loop {
+            iface2.send_dm(&id, "u suck").await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
+
+    // #[tokio::test]
+    // async fn interface_test() {
+    //     let mut iface = Interface::start().await;
+    //     let addr = iface._addr;
+    //     let mut notifee = iface.new_data_notifee.clone();
+    //     let cache = iface.cache.clone();
+    //     let id = iface.pubkey;
+
+    //     let mut iface2 = Interface::start().await;
+    //     let addr2 = iface2._addr;
+    //     let id2 = iface2.pubkey;
+
+    //     // create address book with both of their entries in it
+    //     // iface.add_addr_book(id2, addr2).await;
+    //     // iface2.add_addr_book(id, addr).await;
+
+    //     // spawn task to print iface1 incoming data
+    //     tokio::task::spawn(async move {
+    //         notifee.changed().await.unwrap();
+    //         let x = cache.lock().await.data.pop().unwrap();
+    //         println!("{x:?}");
+    //     });
+    //     // spawn task to send a message and wait for a reply
+    //     tokio::task::spawn(async move {
+    //         // iface2.send_dm_wait_reply(&id, "u r dumb").await;
+    //     });
+
+    //     // iface.send_dm(&id2, "no u").await;
+
+    //     tokio::time::sleep(Duration::from_secs(3)).await;
+    // }
 
     // #[tokio::test]
     // async fn it_works() {
