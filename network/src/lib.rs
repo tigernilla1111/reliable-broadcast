@@ -2,6 +2,7 @@ use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{MethodCallback, MethodResponse, Methods, RpcModule, server};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio;
 
@@ -21,6 +22,43 @@ struct DataCache {
     msg_link_data: Vec<MsgLink>,
 }
 
+type InnerRegistry = HashMap<MsgLinkId, (mpsc::Sender<String>, Option<mpsc::Receiver<String>>)>;
+#[derive(Clone)]
+struct Registry {
+    inner: Arc<Mutex<InnerRegistry>>,
+}
+impl Registry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    // If receiving messages for a MsgLinkId that hasnt been registered yet, it will store sender and receiver
+    // If initiating a MsgLinkId, the rcvr will be returned automatically
+    pub async fn register(&self, msg_id: MsgLinkId) {
+        self.inner.lock().await.entry(msg_id).or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(16);
+            (tx, Some(rx))
+        });
+    }
+    // Return and empty the stored rx channel.  Note: this can only be done once
+    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<mpsc::Receiver<String>> {
+        let mut inner = self.inner.lock().await;
+        let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(16);
+            (tx, Some(rx))
+        });
+        rx.take()
+    }
+    pub async fn deliver(&self, msg_id: MsgLinkId, msg: String) {
+        if let Some((tx, _)) = self.inner.lock().await.get(&msg_id) {
+            let _ = tx.send(msg).await;
+        }
+    }
+    pub async fn remove(&self, msg_id: MsgLinkId) {
+        self.inner.lock().await.remove(&msg_id);
+    }
+}
 // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
 mod api {
     use super::*;
@@ -39,30 +77,31 @@ mod api {
 
     pub struct RpcServerImpl {
         dm_data_notifier: watch::Sender<()>,
-        msg_link_notifier: watch::Sender<()>,
+        msg_link_notifiees: Arc<Mutex<HashMap<MsgLinkId, watch::Receiver<()>>>>,
+        msg_link_sndrs: Arc<Mutex<HashMap<MsgLinkId, watch::Sender<()>>>>,
+        registry: Registry,
         cache: Arc<Mutex<DataCache>>,
         iface: Arc<Interface>,
     }
     impl RpcServerImpl {
         pub fn new(
             dm_data_notifier: watch::Sender<()>,
-            msg_link_notifier: watch::Sender<()>,
+            msg_link_notifiees: Arc<Mutex<HashMap<MsgLinkId, watch::Receiver<()>>>>,
+            registry: Registry,
             cache: Arc<Mutex<DataCache>>,
             iface: Arc<Interface>,
         ) -> Self {
             RpcServerImpl {
                 dm_data_notifier,
-                msg_link_notifier,
+                msg_link_notifiees,
+                msg_link_sndrs: Arc::new(Mutex::new(HashMap::new())),
+                registry,
                 cache,
                 iface,
             }
         }
         async fn add_dm_data(&self, dm_data: DirectMessage) {
             self.cache.lock().await.dm_data.push(dm_data);
-            self.dm_data_notifier.send(()).unwrap();
-        }
-        async fn add_msg_link_data(&self, data: MsgLink) {
-            self.cache.lock().await.msg_link_data.push(data);
             self.dm_data_notifier.send(()).unwrap();
         }
     }
@@ -79,11 +118,12 @@ mod api {
         }
 
         async fn msg(&self, msg: MsgLink) -> RpcResult<()> {
-            self.add_msg_link_data(msg).await;
-            // notify?
-            // do i need to send out an init
+            let msg_id = msg.req_id;
+            // this is returning the rx but we dont need it here
+            // need some way to create the channel without returning rx
+            self.registry.register(msg_id.clone()).await;
+            self.registry.deliver(msg_id, msg.data).await;
 
-            // self.iface.unwrap().reply_msg(rcvr, msg);
             Ok(())
         }
         //async fn msg_reply(&self, msg: MsgRequestId) -> RpcResult<()> {}
@@ -132,9 +172,10 @@ impl MsgLinkId {
     }
 }
 
+#[derive(Clone)]
 struct Notifiees {
     dm_notifee: watch::Receiver<()>,
-    msg_link_notifee: watch::Receiver<()>,
+    msg_link_notifee: Arc<Mutex<HashMap<MsgLinkId, watch::Receiver<()>>>>,
 }
 pub struct Interface {
     /// My IpAddr
@@ -145,10 +186,7 @@ pub struct Interface {
     addr_book: Arc<Mutex<HashMap<UserId, SocketAddr>>>,
     /// Stores clients so I don't have to recreate them for each outgoing connection
     clients: Arc<Mutex<HashMap<SocketAddr, Arc<HttpClient>>>>,
-    /// Active RPC requests that are waiting for a reply value
-    pending_dm_replies: HashMap<MsgLinkId, oneshot::Sender<MsgLink>>,
-    /// Watch channels receivers subscribed to new network data
-    notifees: Notifiees,
+    registry: Registry,
     cache: Arc<Mutex<DataCache>>,
 }
 impl Interface {
@@ -168,21 +206,29 @@ impl Interface {
             .unwrap();
         let addr = server.local_addr().unwrap();
         let (sndr, dm_notifee) = watch::channel(());
-        let (sndr_msg_link, msg_link_notifee) = watch::channel(());
         let notifees = Notifiees {
             dm_notifee,
-            msg_link_notifee,
+            msg_link_notifee: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let registry = Registry {
+            inner: Arc::new(Mutex::new(HashMap::new())),
         };
         let iface = Arc::new(Interface {
             _addr: addr,
             addr_book: Arc::new(Mutex::new(HashMap::new())),
             pubkey: UserId::new(),
             clients: Arc::new(Mutex::new(HashMap::new())),
-            pending_dm_replies: HashMap::new(),
-            notifees,
             cache: cache.clone(),
+            registry: registry.clone(),
         });
-        let server_impl = RpcServerImpl::new(sndr, sndr_msg_link, cache, iface.clone());
+        // Pass notifees in so that new watch channels can be created with new MsgLinks
+        let server_impl = RpcServerImpl::new(
+            sndr,
+            notifees.msg_link_notifee,
+            registry,
+            cache,
+            iface.clone(),
+        );
         // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
         let server_handle = server.start(server_impl.into_rpc());
 
@@ -197,22 +243,16 @@ impl Interface {
     }
 
     /// Test to have a communication exchange
-    pub async fn send_msg_wait_reply(&mut self, rcvr: &UserId, msg: &str) {
+    pub async fn send_msg(&self, rcvr: &UserId, msg: &str, msg_link_id: MsgLinkId) {
         let client = self.connect(rcvr).await;
+        let msg = MsgLink::new(self.pubkey, msg_link_id, msg.to_string());
 
-        // Create oneshot channel to receive the reply
-        let (tx, rx) = oneshot::channel::<MsgLink>();
-        let req_id = MsgLinkId::new();
-        self.pending_dm_replies.insert(req_id.clone(), tx);
-
-        // send dm
         println!("sending msg");
-        let data = MsgLink::new(self.pubkey, req_id, msg.to_string());
-        // client.msg(data).await.unwrap();
+        client.msg(msg).await.unwrap();
 
         // wait for reply
-        let reply = rx.await.unwrap();
-        println!("i got this reply {:?}", reply);
+        // let reply = rx.await.unwrap();
+        // println!("i got this reply {:?}", reply);
     }
 
     pub async fn connect(&self, rcvr: &UserId) -> Arc<HttpClient> {
@@ -243,19 +283,24 @@ mod tests {
         let iface = Interface::new().await;
         let addr = iface._addr;
         let id = iface.pubkey;
+        let msg_id = MsgLinkId::new();
 
-        let mut dm_notifee = iface.notifees.dm_notifee.clone();
+        let mut rx = iface.registry.subscribe(msg_id.clone()).await.unwrap();
+
         tokio::task::spawn(async move {
             loop {
-                dm_notifee.changed().await.unwrap();
-                println!("receved {:?}", iface.cache.lock().await.dm_data.pop());
+                let value = rx.recv().await.unwrap();
+                println!("receved {:?}", value);
             }
         });
 
         let iface2 = Interface::new().await;
         iface2.add_addr_book(id, addr).await;
+        iface2
+            .send_msg(&id, "test with same msg id", msg_id.clone())
+            .await;
         loop {
-            iface2.send_dm(&id, "u suck").await;
+            iface2.send_msg(&id, "u suck", MsgLinkId::new()).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
