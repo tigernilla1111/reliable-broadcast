@@ -1,49 +1,53 @@
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::{MethodCallback, MethodResponse, Methods, RpcModule, server};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 use tokio;
 
-use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use jsonrpsee::rpc_params;
 use jsonrpsee::server::ServerBuilder;
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
-use tokio::time::sleep;
+use tokio::sync::{Mutex, mpsc, mpsc::Receiver, mpsc::Sender};
 // use tower::limit::ConcurrencyLimitLayer;
 use types::UserId;
 
-// TODO: organize the data into purpose.  ie dm messages will go into DataCache::dms and ledger data will go into DataCache::ledger
-// I can get rid of enum Data at this point and just store a vector of structs with info for each data type
-struct DataCache {
-    dm_data: Vec<DirectMessage>,
-    msg_link_data: Vec<MsgLink>,
-}
+// How many DM messages from the network can be stored in the channel
+const MAX_DMS_IN_CHANNEL: usize = 100;
+const MAX_MSGS_PER_LINK_ID: usize = 20;
 
-type InnerRegistry = HashMap<MsgLinkId, (mpsc::Sender<String>, Option<mpsc::Receiver<String>>)>;
+// TODO: instead of string, want to make `String` an event enum to produce events like MessageLinkReceived(id, data)
+// Also want to this for the dm_channel.  Maybe even just have one event return type for both and type def it
+// type RegistryChannel = (Sender<NetEvent>, Option<Receiver<NetEvent>>);
+// enum NetEvent
+type InnerRegistry = HashMap<MsgLinkId, (Sender<String>, Option<Receiver<String>>)>;
 #[derive(Clone)]
 struct Registry {
-    inner: Arc<Mutex<InnerRegistry>>,
+    msg_channel_map: Arc<Mutex<InnerRegistry>>,
+    // Single consumer for dm_data (like every individual MsgLink).
+    dm_channel: Arc<Mutex<(Sender<DirectMessage>, Option<Receiver<DirectMessage>>)>>,
 }
 impl Registry {
     pub fn new() -> Self {
+        let (dm_tx, dm_rx) = mpsc::channel(MAX_DMS_IN_CHANNEL);
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            msg_channel_map: Arc::new(Mutex::new(HashMap::new())),
+            dm_channel: Arc::new(Mutex::new((dm_tx, Some(dm_rx)))),
         }
     }
     // If receiving messages for a MsgLinkId that hasnt been registered yet, it will store sender and receiver
     // If initiating a MsgLinkId, the rcvr will be returned automatically
     pub async fn register(&self, msg_id: MsgLinkId) {
-        self.inner.lock().await.entry(msg_id).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(16);
-            (tx, Some(rx))
-        });
+        self.msg_channel_map
+            .lock()
+            .await
+            .entry(msg_id)
+            .or_insert_with(|| {
+                let (tx, rx) = mpsc::channel(MAX_MSGS_PER_LINK_ID);
+                (tx, Some(rx))
+            });
     }
     // Return and empty the stored rx channel.  Note: this can only be done once
-    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<mpsc::Receiver<String>> {
-        let mut inner = self.inner.lock().await;
+    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<String>> {
+        let mut inner = self.msg_channel_map.lock().await;
         let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
             let (tx, rx) = mpsc::channel(16);
             (tx, Some(rx))
@@ -51,12 +55,18 @@ impl Registry {
         rx.take()
     }
     pub async fn deliver(&self, msg_id: MsgLinkId, msg: String) {
-        if let Some((tx, _)) = self.inner.lock().await.get(&msg_id) {
-            let _ = tx.send(msg).await;
+        if let Some((tx, _)) = self.msg_channel_map.lock().await.get(&msg_id) {
+            tx.send(msg).await.unwrap();
         }
     }
+    pub async fn deliver_dm(&self, dm: DirectMessage) {
+        self.dm_channel.lock().await.0.send(dm).await.unwrap();
+    }
+    pub async fn subcribe_dm(&self) -> Option<Receiver<DirectMessage>> {
+        self.dm_channel.lock().await.1.take()
+    }
     pub async fn remove(&self, msg_id: MsgLinkId) {
-        self.inner.lock().await.remove(&msg_id);
+        self.msg_channel_map.lock().await.remove(&msg_id);
     }
 }
 // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
@@ -76,33 +86,12 @@ mod api {
     }
 
     pub struct RpcServerImpl {
-        dm_data_notifier: watch::Sender<()>,
-        msg_link_notifiees: Arc<Mutex<HashMap<MsgLinkId, watch::Receiver<()>>>>,
-        msg_link_sndrs: Arc<Mutex<HashMap<MsgLinkId, watch::Sender<()>>>>,
         registry: Registry,
-        cache: Arc<Mutex<DataCache>>,
-        iface: Arc<Interface>,
+        _iface: Arc<Interface>,
     }
     impl RpcServerImpl {
-        pub fn new(
-            dm_data_notifier: watch::Sender<()>,
-            msg_link_notifiees: Arc<Mutex<HashMap<MsgLinkId, watch::Receiver<()>>>>,
-            registry: Registry,
-            cache: Arc<Mutex<DataCache>>,
-            iface: Arc<Interface>,
-        ) -> Self {
-            RpcServerImpl {
-                dm_data_notifier,
-                msg_link_notifiees,
-                msg_link_sndrs: Arc::new(Mutex::new(HashMap::new())),
-                registry,
-                cache,
-                iface,
-            }
-        }
-        async fn add_dm_data(&self, dm_data: DirectMessage) {
-            self.cache.lock().await.dm_data.push(dm_data);
-            self.dm_data_notifier.send(()).unwrap();
+        pub fn new(registry: Registry, _iface: Arc<Interface>) -> Self {
+            RpcServerImpl { registry, _iface }
         }
     }
 
@@ -112,18 +101,14 @@ mod api {
             Ok(format!("pong"))
         }
         async fn dm(&self, dm: DirectMessage) -> RpcResult<()> {
-            let data = DirectMessage::new(dm.sender, dm.msg.as_str());
-            self.add_dm_data(data).await;
+            self.registry.deliver_dm(dm).await;
             Ok(())
         }
 
         async fn msg(&self, msg: MsgLink) -> RpcResult<()> {
             let msg_id = msg.req_id;
-            // this is returning the rx but we dont need it here
-            // need some way to create the channel without returning rx
             self.registry.register(msg_id.clone()).await;
             self.registry.deliver(msg_id, msg.data).await;
-
             Ok(())
         }
         //async fn msg_reply(&self, msg: MsgRequestId) -> RpcResult<()> {}
@@ -164,18 +149,12 @@ use api::{MyRpcClient, MyRpcServer, RpcServerImpl};
 
 use crate::api::{DirectMessage, MsgLink};
 
-#[derive(PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct MsgLinkId(u64);
+#[derive(PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+pub struct MsgLinkId(u64);
 impl MsgLinkId {
     pub fn new() -> Self {
         Self(rand::Rng::random(&mut rand::rng()))
     }
-}
-
-#[derive(Clone)]
-struct Notifiees {
-    dm_notifee: watch::Receiver<()>,
-    msg_link_notifee: Arc<Mutex<HashMap<MsgLinkId, watch::Receiver<()>>>>,
 }
 pub struct Interface {
     /// My IpAddr
@@ -187,14 +166,9 @@ pub struct Interface {
     /// Stores clients so I don't have to recreate them for each outgoing connection
     clients: Arc<Mutex<HashMap<SocketAddr, Arc<HttpClient>>>>,
     registry: Registry,
-    cache: Arc<Mutex<DataCache>>,
 }
 impl Interface {
     pub async fn new() -> Arc<Self> {
-        let cache: Arc<Mutex<DataCache>> = Arc::new(Mutex::new(DataCache {
-            dm_data: Vec::new(),
-            msg_link_data: Vec::new(),
-        }));
         let server = ServerBuilder::default()
             // TODO vvv
             // .set_http_middleware(tower::ServiceBuilder::new()
@@ -205,30 +179,16 @@ impl Interface {
             .await
             .unwrap();
         let addr = server.local_addr().unwrap();
-        let (sndr, dm_notifee) = watch::channel(());
-        let notifees = Notifiees {
-            dm_notifee,
-            msg_link_notifee: Arc::new(Mutex::new(HashMap::new())),
-        };
-        let registry = Registry {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let registry = Registry::new();
         let iface = Arc::new(Interface {
             _addr: addr,
             addr_book: Arc::new(Mutex::new(HashMap::new())),
             pubkey: UserId::new(),
             clients: Arc::new(Mutex::new(HashMap::new())),
-            cache: cache.clone(),
             registry: registry.clone(),
         });
         // Pass notifees in so that new watch channels can be created with new MsgLinks
-        let server_impl = RpcServerImpl::new(
-            sndr,
-            notifees.msg_link_notifee,
-            registry,
-            cache,
-            iface.clone(),
-        );
+        let server_impl = RpcServerImpl::new(registry, iface.clone());
         // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
         let server_handle = server.start(server_impl.into_rpc());
 
@@ -240,19 +200,22 @@ impl Interface {
         let client = self.connect(rcvr).await;
         let dm = DirectMessage::new(self.pubkey, msg);
         client.dm(dm).await.unwrap();
+        println!(
+            "{:?}, {}, sent msg to {:?}, {:?}",
+            self.pubkey, self._addr, rcvr, msg
+        );
     }
 
     /// Test to have a communication exchange
     pub async fn send_msg(&self, rcvr: &UserId, msg: &str, msg_link_id: MsgLinkId) {
         let client = self.connect(rcvr).await;
-        let msg = MsgLink::new(self.pubkey, msg_link_id, msg.to_string());
-
-        println!("sending msg");
-        client.msg(msg).await.unwrap();
-
-        // wait for reply
-        // let reply = rx.await.unwrap();
-        // println!("i got this reply {:?}", reply);
+        let msg_link = MsgLink::new(self.pubkey, msg_link_id, msg.to_string());
+        self.registry.register(msg_link_id).await;
+        client.msg(msg_link).await.unwrap();
+        println!(
+            "{:?}, {}, sent msg to {:?}, {:?}",
+            self.pubkey, self._addr, rcvr, msg
+        );
     }
 
     pub async fn connect(&self, rcvr: &UserId) -> Arc<HttpClient> {
@@ -272,11 +235,9 @@ impl Interface {
 
 #[cfg(test)]
 mod tests {
-    use jsonrpsee::RpcModule;
-
-    use crate::api::DirectMessage;
 
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn interface_test() {
