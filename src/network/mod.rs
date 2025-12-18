@@ -19,23 +19,26 @@ mod api {
     use super::*;
     // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
     #[rpc(server, client)]
-    pub trait MyRpc {
+    pub trait MyRpc<T> {
         #[method(name = "msg")]
-        async fn msg(&self, msg: MsgLink) -> RpcResult<()>;
+        async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()>;
     }
 
-    pub struct MsgLinkServer {
-        registry: Registry,
+    pub struct MsgLinkServer<T> {
+        registry: Registry<T>,
     }
-    impl MsgLinkServer {
-        pub fn new(registry: Registry) -> Self {
+    impl<T> MsgLinkServer<T> {
+        pub fn new(registry: Registry<T>) -> Self {
             MsgLinkServer { registry }
         }
     }
 
     #[async_trait]
-    impl MyRpcServer for MsgLinkServer {
-        async fn msg(&self, msg: MsgLink) -> RpcResult<()> {
+    impl<T> MyRpcServer<T> for MsgLinkServer<T>
+    where
+        T: Send + 'static,
+    {
+        async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()> {
             let msg_id = msg.msg_id;
             self.registry.register(msg_id.clone()).await;
             self.registry.deliver(msg).await;
@@ -44,12 +47,12 @@ mod api {
     }
 }
 
-type InnerRegistry = HashMap<MsgLinkId, (Sender<MsgLink>, Option<Receiver<MsgLink>>)>;
+type InnerRegistry<T> = HashMap<MsgLinkId, (Sender<MsgLink<T>>, Option<Receiver<MsgLink<T>>>)>;
 #[derive(Clone)]
-pub struct Registry {
-    msg_channel_map: Arc<Mutex<InnerRegistry>>,
+pub struct Registry<T> {
+    msg_channel_map: Arc<Mutex<InnerRegistry<T>>>,
 }
-impl Registry {
+impl<T> Registry<T> {
     pub fn new() -> Self {
         Self {
             msg_channel_map: Arc::new(Mutex::new(HashMap::new())),
@@ -68,7 +71,7 @@ impl Registry {
             });
     }
     // Return and empty the stored rx channel.  Note: this can only be done once
-    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink>> {
+    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink<T>>> {
         let mut inner = self.msg_channel_map.lock().await;
         let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
             let (tx, rx) = mpsc::channel(16);
@@ -76,7 +79,7 @@ impl Registry {
         });
         rx.take()
     }
-    pub async fn deliver(&self, msg: MsgLink) {
+    pub async fn deliver(&self, msg: MsgLink<T>) {
         if let Some((tx, _)) = self.msg_channel_map.lock().await.get(msg.get_msg_id()) {
             tx.send(msg).await.unwrap();
         }
@@ -88,18 +91,25 @@ impl Registry {
 
 use api::{MsgLinkServer, MyRpcClient, MyRpcServer};
 
+pub trait Data:
+    Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Clone + 'static
+{
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum MsgLinkData {
     Send(Signature, Vec<LedgerDiff>),
 }
+impl Data for MsgLinkData {}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct MsgLink {
+pub struct MsgLink<T> {
     sender: UserId,
     msg_id: MsgLinkId,
-    data: MsgLinkData,
+    data: T,
 }
-impl MsgLink {
-    pub fn new(sender: UserId, req_id: MsgLinkId, data: MsgLinkData) -> Self {
+impl<T> MsgLink<T> {
+    pub fn new(sender: UserId, req_id: MsgLinkId, data: T) -> Self {
         Self {
             sender,
             msg_id: req_id,
@@ -118,12 +128,12 @@ impl MsgLinkId {
     }
 }
 
-pub fn create_msg_link_rpc_module(registry: Registry) -> jsonrpsee::RpcModule<()> {
+pub fn create_msg_link_rpc_module<T: Data>(registry: Registry<T>) -> jsonrpsee::RpcModule<()> {
     let server_impl = MsgLinkServer::new(registry);
     // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
     server_impl.into_rpc().remove_context()
 }
-pub struct Interface {
+pub struct Interface<T> {
     /// My IpAddr
     _addr: SocketAddr,
     /// TODO: My PubKey
@@ -132,9 +142,9 @@ pub struct Interface {
     addr_book: Arc<Mutex<HashMap<UserId, SocketAddr>>>,
     /// Stores clients so I don't have to recreate them for each outgoing connection
     clients: Arc<Mutex<HashMap<SocketAddr, Arc<HttpClient>>>>,
-    registry: Registry,
+    registry: Registry<T>,
 }
-impl Interface {
+impl<T: Data> Interface<T> {
     pub async fn new() -> Arc<Self> {
         let server = ServerBuilder::default()
             .set_http_middleware(
@@ -204,12 +214,12 @@ mod tests {
 
         tokio::task::spawn(async move {
             loop {
-                let value = rx.recv().await.unwrap();
+                let value: MsgLink<MsgLinkData> = rx.recv().await.unwrap();
                 println!("receved {:?}", value);
             }
         });
 
-        let iface2 = Interface::new().await;
+        let iface2: Arc<Interface<MsgLinkData>> = Interface::new().await;
         iface2.add_addr_book(id, addr).await;
         let msg_link_data = MsgLinkData::Send("sign0x0dj03dm0".to_string(), Vec::new());
         iface2
@@ -219,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_subscribe_only_once() {
-        let registry = Registry::new();
+        let registry: Registry<MsgLinkData> = Registry::new();
         let msg_id = MsgLinkId::new(98);
 
         // First subscribe should succeed
@@ -258,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn interface_send_before_receiver_subscribes() {
-        let iface1 = Interface::new().await;
+        let iface1: Arc<Interface<MsgLinkData>> = Interface::new().await;
         let iface2 = Interface::new().await;
 
         // Exchange address
@@ -280,10 +290,11 @@ mod tests {
             .expect("receiver should exist");
 
         // The message should already be buffered
-        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out waiting for buffered msg")
-            .expect("channel closed unexpectedly");
+        let received: MsgLink<MsgLinkData> =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("timed out waiting for buffered msg")
+                .expect("channel closed unexpectedly");
 
         assert_eq!(*received.get_msg_id(), msg_id);
     }

@@ -1,29 +1,29 @@
 use crate::network::{Interface, MsgLinkData, MsgLinkId};
 use crate::types::{LedgerDiff, Signature, UserId};
-/// Start a reliable broadcast
-async fn broadcast_init(
-    iface: Interface,
-    recipients: Vec<UserId>,
-    msg_data: Vec<LedgerDiff>,
-    round_num: MsgLinkId,
-) {
-    let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
-    let data = MsgLinkData::Send(sig, msg_data);
-    for rcvr in recipients.iter() {
-        iface.send_msg(rcvr, data.clone(), round_num).await;
-    }
-}
+// /// Start a reliable broadcast
+// async fn broadcast_init(
+//     iface: Interface,
+//     recipients: Vec<UserId>,
+//     msg_data: Vec<LedgerDiff>,
+//     round_num: MsgLinkId,
+// ) {
+//     let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
+//     let data = MsgLinkData::Send(sig, msg_data);
+//     for rcvr in recipients.iter() {
+//         iface.send_msg(rcvr, data.clone(), round_num).await;
+//     }
+// }
 
-async fn broadcast(
-    iface: Interface,
-    recipients: Vec<UserId>,
-    msg_data: MsgLinkData,
-    round_num: MsgLinkId,
-) {
-    for rcvr in recipients.iter() {
-        iface.send_msg(rcvr, msg_data.clone(), round_num).await;
-    }
-}
+// async fn broadcast(
+//     iface: Interface,
+//     recipients: Vec<UserId>,
+//     msg_data: MsgLinkData,
+//     round_num: MsgLinkId,
+// ) {
+//     for rcvr in recipients.iter() {
+//         iface.send_msg(rcvr, msg_data.clone(), round_num).await;
+//     }
+// }
 
 // TODO: turn this into a reliable broadcast crate
 // - instead of Vec of LedgerDiff, allow it to be generic over some value T
