@@ -4,34 +4,60 @@ use std::collections::HashMap;
 use std::{net::SocketAddr, sync::Arc};
 use tokio;
 
+use crate::types::{LedgerDiff, Signature, UserId};
+// use jsonrpsee::core::middleware::RequestBodyLimitLayer;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::server::ServerBuilder;
+// use jsonrpsee::server::middleware::http::RequestBodyLimitLayer;
 use tokio::sync::{Mutex, mpsc, mpsc::Receiver, mpsc::Sender};
-// use tower::limit::ConcurrencyLimitLayer;
-use crate::types::{LedgerDiff, Signature, UserId};
+use tower::limit::ConcurrencyLimitLayer;
 
 // How many DM messages from the network can be stored in the channel
-const MAX_DMS_IN_CHANNEL: usize = 100;
 const MAX_MSGS_PER_LINK_ID: usize = 20;
 
-type InnerRegistry = HashMap<RoundNum, (Sender<MsgLink>, Option<Receiver<MsgLink>>)>;
+mod api {
+    use super::*;
+    // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
+    #[rpc(server, client)]
+    pub trait MyRpc {
+        #[method(name = "msg")]
+        async fn msg(&self, msg: MsgLink) -> RpcResult<()>;
+    }
+
+    pub struct MsgLinkServer {
+        registry: Registry,
+    }
+    impl MsgLinkServer {
+        pub fn new(registry: Registry) -> Self {
+            MsgLinkServer { registry }
+        }
+    }
+
+    #[async_trait]
+    impl MyRpcServer for MsgLinkServer {
+        async fn msg(&self, msg: MsgLink) -> RpcResult<()> {
+            let msg_id = msg.msg_id;
+            self.registry.register(msg_id.clone()).await;
+            self.registry.deliver(msg).await;
+            Ok(())
+        }
+    }
+}
+
+type InnerRegistry = HashMap<MsgLinkId, (Sender<MsgLink>, Option<Receiver<MsgLink>>)>;
 #[derive(Clone)]
-struct Registry {
+pub struct Registry {
     msg_channel_map: Arc<Mutex<InnerRegistry>>,
-    // Single consumer for dm_data (like every individual MsgLink).
-    dm_channel: Arc<Mutex<(Sender<DirectMessage>, Option<Receiver<DirectMessage>>)>>,
 }
 impl Registry {
     pub fn new() -> Self {
-        let (dm_tx, dm_rx) = mpsc::channel(MAX_DMS_IN_CHANNEL);
         Self {
             msg_channel_map: Arc::new(Mutex::new(HashMap::new())),
-            dm_channel: Arc::new(Mutex::new((dm_tx, Some(dm_rx)))),
         }
     }
     // If receiving messages for a MsgLinkId that hasnt been registered yet, it will store sender and receiver
     // If initiating a MsgLinkId, the rcvr will be returned automatically
-    pub async fn register(&self, msg_id: RoundNum) {
+    pub async fn register(&self, msg_id: MsgLinkId) {
         self.msg_channel_map
             .lock()
             .await
@@ -42,7 +68,7 @@ impl Registry {
             });
     }
     // Return and empty the stored rx channel.  Note: this can only be done once
-    pub async fn subscribe(&self, msg_id: RoundNum) -> Option<Receiver<MsgLink>> {
+    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink>> {
         let mut inner = self.msg_channel_map.lock().await;
         let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
             let (tx, rx) = mpsc::channel(16);
@@ -55,82 +81,13 @@ impl Registry {
             tx.send(msg).await.unwrap();
         }
     }
-    pub async fn deliver_dm(&self, dm: DirectMessage) {
-        self.dm_channel.lock().await.0.send(dm).await.unwrap();
-    }
-    pub async fn subcribe_dm(&self) -> Option<Receiver<DirectMessage>> {
-        self.dm_channel.lock().await.1.take()
-    }
-    pub async fn remove(&self, msg_id: RoundNum) {
+    pub async fn remove(&self, msg_id: MsgLinkId) {
         self.msg_channel_map.lock().await.remove(&msg_id);
     }
 }
 
-mod api {
-    use crate::types::{LedgerDiff, Signature};
+use api::{MsgLinkServer, MyRpcClient, MyRpcServer};
 
-    use super::*;
-    // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
-    #[rpc(server, client)]
-    pub trait MyRpc {
-        #[method(name = "ping")]
-        async fn ping(&self) -> RpcResult<String>;
-        #[method(name = "dm")]
-        async fn dm(&self, msg: DirectMessage) -> RpcResult<()>;
-
-        #[method(name = "msg")]
-        async fn msg(&self, msg: MsgLink) -> RpcResult<()>;
-        // #[method(name = "msg_reply")]
-        // async fn msg_reply(&self, msg: MsgRequestId) -> RpcResult<()>;
-    }
-
-    pub struct RpcServerImpl {
-        registry: Registry,
-        _iface: Arc<Interface>,
-    }
-    impl RpcServerImpl {
-        pub fn new(registry: Registry, _iface: Arc<Interface>) -> Self {
-            RpcServerImpl { registry, _iface }
-        }
-    }
-
-    #[async_trait]
-    impl MyRpcServer for RpcServerImpl {
-        async fn ping(&self) -> RpcResult<String> {
-            Ok(format!("pong"))
-        }
-        async fn dm(&self, dm: DirectMessage) -> RpcResult<()> {
-            self.registry.deliver_dm(dm).await;
-            Ok(())
-        }
-
-        async fn msg(&self, msg: MsgLink) -> RpcResult<()> {
-            let msg_id = msg.msg_id;
-            self.registry.register(msg_id.clone()).await;
-            self.registry.deliver(msg).await;
-            Ok(())
-        }
-        //async fn msg_reply(&self, msg: MsgRequestId) -> RpcResult<()> {}
-    }
-
-    #[derive(serde::Serialize, serde::Deserialize, Debug)]
-    pub struct DirectMessage {
-        sender: UserId,
-        msg: String,
-    }
-    impl DirectMessage {
-        pub fn new(sender: UserId, msg: &str) -> Self {
-            DirectMessage {
-                sender,
-                msg: msg.to_string(),
-            }
-        }
-    }
-}
-
-use api::{MyRpcClient, MyRpcServer, RpcServerImpl};
-
-use api::DirectMessage;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum MsgLinkData {
     Send(Signature, Vec<LedgerDiff>),
@@ -138,27 +95,33 @@ pub enum MsgLinkData {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct MsgLink {
     sender: UserId,
-    msg_id: RoundNum,
+    msg_id: MsgLinkId,
     data: MsgLinkData,
 }
 impl MsgLink {
-    pub fn new(sender: UserId, req_id: RoundNum, data: MsgLinkData) -> Self {
+    pub fn new(sender: UserId, req_id: MsgLinkId, data: MsgLinkData) -> Self {
         Self {
             sender,
             msg_id: req_id,
             data,
         }
     }
-    pub fn get_msg_id(&self) -> &RoundNum {
+    pub fn get_msg_id(&self) -> &MsgLinkId {
         &self.msg_id
     }
 }
 #[derive(PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
-pub struct RoundNum(u128);
-impl RoundNum {
-    pub fn new(round: u128) -> Self {
-        Self(round)
+pub struct MsgLinkId(u128);
+impl MsgLinkId {
+    pub fn new(id: u128) -> Self {
+        Self(id)
     }
+}
+
+pub fn create_msg_link_rpc_module(registry: Registry) -> jsonrpsee::RpcModule<()> {
+    let server_impl = MsgLinkServer::new(registry);
+    // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
+    server_impl.into_rpc().remove_context()
 }
 pub struct Interface {
     /// My IpAddr
@@ -174,11 +137,9 @@ pub struct Interface {
 impl Interface {
     pub async fn new() -> Arc<Self> {
         let server = ServerBuilder::default()
-            // TODO vvv
-            // .set_http_middleware(tower::ServiceBuilder::new()
-            //.layer(ConcurrencyLimitLayer::new(1000))
-            //.layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1 MB
-            //)
+            .set_http_middleware(
+                tower::ServiceBuilder::new().layer(ConcurrencyLimitLayer::new(1000)), // .layer(RequestBodyLimitLayer::new(1024 * 1024)), // 1 MB
+            )
             .build("127.0.0.1:0")
             .await
             .unwrap();
@@ -191,27 +152,16 @@ impl Interface {
             clients: Arc::new(Mutex::new(HashMap::new())),
             registry: registry.clone(),
         });
-        // Pass notifees in so that new watch channels can be created with new MsgLinks
-        let server_impl = RpcServerImpl::new(registry, iface.clone());
-        // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
-        let server_handle = server.start(server_impl.into_rpc());
+
+        let server_handle = server.start(create_msg_link_rpc_module(registry));
 
         tokio::spawn(server_handle.stopped());
 
         iface
     }
-    pub async fn send_dm(&self, rcvr: &UserId, msg: &str) {
-        let client = self.connect(rcvr).await;
-        let dm = DirectMessage::new(self.pubkey, msg);
-        client.dm(dm).await.unwrap();
-        println!(
-            "{:?}, {}, sent msg to {:?}, {:?}",
-            self.pubkey, self._addr, rcvr, msg
-        );
-    }
 
     /// Test to have a communication exchange
-    pub async fn send_msg(&self, rcvr: &UserId, msg_data: MsgLinkData, msg_link_id: RoundNum) {
+    pub async fn send_msg(&self, rcvr: &UserId, msg_data: MsgLinkData, msg_link_id: MsgLinkId) {
         println!(
             "{:?}, {}, sending msg to {:?}, {:?}",
             self.pubkey, self._addr, rcvr, msg_data
@@ -248,7 +198,7 @@ mod tests {
         let iface = Interface::new().await;
         let addr = iface._addr;
         let id = iface.pubkey;
-        let msg_id = RoundNum::new(68);
+        let msg_id = MsgLinkId::new(68);
 
         let mut rx = iface.registry.subscribe(msg_id.clone()).await.unwrap();
 
@@ -270,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn registry_subscribe_only_once() {
         let registry = Registry::new();
-        let msg_id = RoundNum::new(98);
+        let msg_id = MsgLinkId::new(98);
 
         // First subscribe should succeed
         let rx1 = registry.subscribe(msg_id).await;
@@ -283,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn registry_send_before_subscribe() {
         let registry = Registry::new();
-        let msg_id = RoundNum::new(789);
+        let msg_id = MsgLinkId::new(789);
         let sender = UserId::new();
 
         let msg = MsgLink::new(sender, msg_id, MsgLinkData::Send("sig".to_string(), vec![]));
@@ -314,7 +264,7 @@ mod tests {
         // Exchange address
         iface1.add_addr_book(iface2.pubkey, iface2._addr).await;
 
-        let msg_id = RoundNum::new(987);
+        let msg_id = MsgLinkId::new(987);
         let msg_data = MsgLinkData::Send("sig-buffered".to_string(), Vec::new());
 
         // Send BEFORE iface2 subscribes or registers
@@ -342,8 +292,8 @@ mod tests {
         let registry = Registry::new();
         let sender = UserId::new();
 
-        let msg_id_a = RoundNum::new(222);
-        let msg_id_b = RoundNum::new(333);
+        let msg_id_a = MsgLinkId::new(222);
+        let msg_id_b = MsgLinkId::new(333);
 
         registry.register(msg_id_a).await;
         registry.register(msg_id_b).await;
