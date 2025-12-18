@@ -1,5 +1,5 @@
 mod network;
-// mod protocol;
+mod protocol;
 mod types;
 fn main() {
     println!("Hello, world!");

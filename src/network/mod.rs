@@ -4,22 +4,17 @@ use std::collections::HashMap;
 use std::{net::SocketAddr, sync::Arc};
 use tokio;
 
-use crate::network::api::MsgLinkData;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::server::ServerBuilder;
 use tokio::sync::{Mutex, mpsc, mpsc::Receiver, mpsc::Sender};
 // use tower::limit::ConcurrencyLimitLayer;
-use crate::types::UserId;
+use crate::types::{LedgerDiff, Signature, UserId};
 
 // How many DM messages from the network can be stored in the channel
 const MAX_DMS_IN_CHANNEL: usize = 100;
 const MAX_MSGS_PER_LINK_ID: usize = 20;
 
-// TODO: instead of string, want to make `String` an event enum to produce events like MessageLinkReceived(id, data)
-// Also want to this for the dm_channel.  Maybe even just have one event return type for both and type def it
-// type RegistryChannel = (Sender<NetEvent>, Option<Receiver<NetEvent>>);
-// enum NetEvent
-type InnerRegistry = HashMap<MsgLinkId, (Sender<MsgLink>, Option<Receiver<MsgLink>>)>;
+type InnerRegistry = HashMap<RoundNum, (Sender<MsgLink>, Option<Receiver<MsgLink>>)>;
 #[derive(Clone)]
 struct Registry {
     msg_channel_map: Arc<Mutex<InnerRegistry>>,
@@ -36,7 +31,7 @@ impl Registry {
     }
     // If receiving messages for a MsgLinkId that hasnt been registered yet, it will store sender and receiver
     // If initiating a MsgLinkId, the rcvr will be returned automatically
-    pub async fn register(&self, msg_id: MsgLinkId) {
+    pub async fn register(&self, msg_id: RoundNum) {
         self.msg_channel_map
             .lock()
             .await
@@ -47,7 +42,7 @@ impl Registry {
             });
     }
     // Return and empty the stored rx channel.  Note: this can only be done once
-    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink>> {
+    pub async fn subscribe(&self, msg_id: RoundNum) -> Option<Receiver<MsgLink>> {
         let mut inner = self.msg_channel_map.lock().await;
         let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
             let (tx, rx) = mpsc::channel(16);
@@ -66,20 +61,16 @@ impl Registry {
     pub async fn subcribe_dm(&self) -> Option<Receiver<DirectMessage>> {
         self.dm_channel.lock().await.1.take()
     }
-    pub async fn remove(&self, msg_id: MsgLinkId) {
+    pub async fn remove(&self, msg_id: RoundNum) {
         self.msg_channel_map.lock().await.remove(&msg_id);
     }
-}
-// This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
-enum NetEvent {
-    ReceivedDirectMessage,
-    ReceivedMsgLink(MsgLink),
 }
 
 mod api {
     use crate::types::{LedgerDiff, Signature};
 
     use super::*;
+    // This generates: PeerApiServer (server trait to implement) and PeerApiClient (client stub used to call peers)
     #[rpc(server, client)]
     pub trait MyRpc {
         #[method(name = "ping")]
@@ -135,39 +126,38 @@ mod api {
             }
         }
     }
-    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-    pub enum MsgLinkData {
-        RoundOne(Signature, Vec<LedgerDiff>),
-    }
-    #[derive(serde::Serialize, serde::Deserialize, Debug)]
-    pub struct MsgLink {
-        sender: UserId,
-        msg_id: MsgLinkId,
-        data: MsgLinkData,
-    }
-    impl MsgLink {
-        pub fn new(sender: UserId, req_id: MsgLinkId, data: MsgLinkData) -> Self {
-            Self {
-                sender,
-                msg_id: req_id,
-                data,
-            }
-        }
-        pub fn get_msg_id(&self) -> &MsgLinkId {
-            &self.msg_id
-        }
-    }
 }
 
 use api::{MyRpcClient, MyRpcServer, RpcServerImpl};
 
-use api::{DirectMessage, MsgLink};
-
+use api::DirectMessage;
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum MsgLinkData {
+    Send(Signature, Vec<LedgerDiff>),
+}
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct MsgLink {
+    sender: UserId,
+    msg_id: RoundNum,
+    data: MsgLinkData,
+}
+impl MsgLink {
+    pub fn new(sender: UserId, req_id: RoundNum, data: MsgLinkData) -> Self {
+        Self {
+            sender,
+            msg_id: req_id,
+            data,
+        }
+    }
+    pub fn get_msg_id(&self) -> &RoundNum {
+        &self.msg_id
+    }
+}
 #[derive(PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
-pub struct MsgLinkId(u64);
-impl MsgLinkId {
-    pub fn new() -> Self {
-        Self(rand::Rng::random(&mut rand::rng()))
+pub struct RoundNum(u128);
+impl RoundNum {
+    pub fn new(round: u128) -> Self {
+        Self(round)
     }
 }
 pub struct Interface {
@@ -221,7 +211,7 @@ impl Interface {
     }
 
     /// Test to have a communication exchange
-    pub async fn send_msg(&self, rcvr: &UserId, msg_data: MsgLinkData, msg_link_id: MsgLinkId) {
+    pub async fn send_msg(&self, rcvr: &UserId, msg_data: MsgLinkData, msg_link_id: RoundNum) {
         println!(
             "{:?}, {}, sending msg to {:?}, {:?}",
             self.pubkey, self._addr, rcvr, msg_data
@@ -258,7 +248,7 @@ mod tests {
         let iface = Interface::new().await;
         let addr = iface._addr;
         let id = iface.pubkey;
-        let msg_id = MsgLinkId::new();
+        let msg_id = RoundNum::new(68);
 
         let mut rx = iface.registry.subscribe(msg_id.clone()).await.unwrap();
 
@@ -271,7 +261,7 @@ mod tests {
 
         let iface2 = Interface::new().await;
         iface2.add_addr_book(id, addr).await;
-        let msg_link_data = MsgLinkData::RoundOne("sign0x0dj03dm0".to_string(), Vec::new());
+        let msg_link_data = MsgLinkData::Send("sign0x0dj03dm0".to_string(), Vec::new());
         iface2
             .send_msg(&id, msg_link_data.clone(), msg_id.clone())
             .await;
@@ -280,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn registry_subscribe_only_once() {
         let registry = Registry::new();
-        let msg_id = MsgLinkId::new();
+        let msg_id = RoundNum::new(98);
 
         // First subscribe should succeed
         let rx1 = registry.subscribe(msg_id).await;
@@ -293,14 +283,10 @@ mod tests {
     #[tokio::test]
     async fn registry_send_before_subscribe() {
         let registry = Registry::new();
-        let msg_id = MsgLinkId::new();
+        let msg_id = RoundNum::new(789);
         let sender = UserId::new();
 
-        let msg = MsgLink::new(
-            sender,
-            msg_id,
-            MsgLinkData::RoundOne("sig".to_string(), vec![]),
-        );
+        let msg = MsgLink::new(sender, msg_id, MsgLinkData::Send("sig".to_string(), vec![]));
 
         // Register the msg_id but DO NOT subscribe yet
         registry.register(msg_id).await;
@@ -328,8 +314,8 @@ mod tests {
         // Exchange address
         iface1.add_addr_book(iface2.pubkey, iface2._addr).await;
 
-        let msg_id = MsgLinkId::new();
-        let msg_data = MsgLinkData::RoundOne("sig-buffered".to_string(), Vec::new());
+        let msg_id = RoundNum::new(987);
+        let msg_data = MsgLinkData::Send("sig-buffered".to_string(), Vec::new());
 
         // Send BEFORE iface2 subscribes or registers
         iface1
@@ -356,8 +342,8 @@ mod tests {
         let registry = Registry::new();
         let sender = UserId::new();
 
-        let msg_id_a = MsgLinkId::new();
-        let msg_id_b = MsgLinkId::new();
+        let msg_id_a = RoundNum::new(222);
+        let msg_id_b = RoundNum::new(333);
 
         registry.register(msg_id_a).await;
         registry.register(msg_id_b).await;
@@ -367,7 +353,7 @@ mod tests {
             .deliver(MsgLink::new(
                 sender,
                 msg_id_a,
-                MsgLinkData::RoundOne("unused".to_string(), vec![]),
+                MsgLinkData::Send("unused".to_string(), vec![]),
             ))
             .await;
 
@@ -375,7 +361,7 @@ mod tests {
             .deliver(MsgLink::new(
                 sender,
                 msg_id_b,
-                MsgLinkData::RoundOne("unused".to_string(), vec![]),
+                MsgLinkData::Send("unused".to_string(), vec![]),
             ))
             .await;
 
@@ -383,7 +369,7 @@ mod tests {
             .deliver(MsgLink::new(
                 sender,
                 msg_id_a,
-                MsgLinkData::RoundOne("unused".to_string(), vec![]),
+                MsgLinkData::Send("unused".to_string(), vec![]),
             ))
             .await;
 
