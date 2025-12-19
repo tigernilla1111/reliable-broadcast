@@ -117,22 +117,17 @@ impl<T> Data for T where
 {
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub enum MsgLinkData {
-    Send(Signature, Vec<LedgerDiff>),
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct MsgLink<T> {
     sender: SocketAddr,
     msg_id: MsgLinkId,
-    data: T,
+    pub data: T,
 }
 impl<T> MsgLink<T> {
-    pub fn new(sender: SocketAddr, req_id: MsgLinkId, data: T) -> Self {
+    pub fn new(sender: SocketAddr, msg_id: MsgLinkId, data: T) -> Self {
         Self {
             sender,
-            msg_id: req_id,
+            msg_id,
             data,
         }
     }
@@ -184,7 +179,7 @@ impl<T: Data> Interface<T> {
         iface
     }
 
-    /// Test to have a communication exchange
+    /// Registers the msg_link_id in the registry before sending
     pub async fn send_msg(&self, rcvr: &SocketAddr, msg_data: T, msg_link_id: MsgLinkId) {
         println!("{}, sending msg to {:?}, {:?}", self.addr, rcvr, msg_data);
         let client = self.connect(rcvr).await;
@@ -193,7 +188,6 @@ impl<T: Data> Interface<T> {
         client.msg(msg_link).await.unwrap();
     }
 
-    // TODO: make connect take a socketaddr instead of a pubkey/userId
     pub async fn connect(&self, addr: &SocketAddr) -> Arc<HttpClient> {
         let mut clients = self.clients.lock().await;
         let client = clients.entry(*addr).or_insert_with(|| {
@@ -400,13 +394,9 @@ mod tests {
         registry.register(msg_id).await;
 
         // Fill the channel beyond MAX_MSGS_PER_LINK_ID
-        for i in 0..(MAX_MSGS_PER_LINK_ID + 5) {
+        for _ in 0..(MAX_MSGS_PER_LINK_ID + 5) {
             let _ = registry
-                .deliver(MsgLink::new(
-                    sender,
-                    msg_id,
-                    MsgLinkData::Send(format!("msg-{}", i), vec![]),
-                ))
+                .deliver(MsgLink::new(sender, msg_id, "test_data"))
                 .await;
         }
 

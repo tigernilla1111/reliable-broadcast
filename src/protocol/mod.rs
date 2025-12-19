@@ -1,29 +1,51 @@
-use crate::network::{Interface, MsgLinkData, MsgLinkId};
-use crate::types::{LedgerDiff, Signature, UserId};
-// /// Start a reliable broadcast
-// async fn broadcast_init(
-//     iface: Interface,
-//     recipients: Vec<UserId>,
-//     msg_data: Vec<LedgerDiff>,
-//     round_num: MsgLinkId,
-// ) {
-//     let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
-//     let data = MsgLinkData::Send(sig, msg_data);
-//     for rcvr in recipients.iter() {
-//         iface.send_msg(rcvr, data.clone(), round_num).await;
-//     }
-// }
+use std::net::SocketAddr;
 
-// async fn broadcast(
-//     iface: Interface,
-//     recipients: Vec<UserId>,
-//     msg_data: MsgLinkData,
-//     round_num: MsgLinkId,
-// ) {
-//     for rcvr in recipients.iter() {
-//         iface.send_msg(rcvr, msg_data.clone(), round_num).await;
-//     }
-// }
+use bincode::serde::encode_to_vec;
+use sha2::{Digest, Sha256};
+
+use crate::network::{Data, Interface, MsgLinkId};
+use crate::types::{LedgerDiff, Signature, UserId};
+
+const MAX_ENCODING_BYTES: usize = 10000;
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+enum BroadcastRound<T> {
+    Init(MsgLinkId, T),
+    Echo(MsgLinkId, [u8; 32]),
+    Ready(MsgLinkId, [u8; 32]),
+}
+/// Start a reliable broadcast
+async fn broadcast_init<T: Data>(
+    iface: Interface<BroadcastRound<T>>,
+    recipients: Vec<SocketAddr>,
+    data: T,
+    msg_link_id: MsgLinkId,
+) {
+    let data = BroadcastRound::Init(msg_link_id, data);
+    let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
+    for rcvr in recipients.iter() {
+        iface.send_msg(rcvr, data.clone(), msg_link_id).await;
+    }
+    let mut rx = iface.registry.subscribe(msg_link_id).await.unwrap();
+    while let Some(msg) = rx.recv().await {
+        match msg.data {
+            BroadcastRound::Init(_, _) => {}
+            BroadcastRound::Echo(_, _) => {}
+            BroadcastRound::Ready(_, _) => {}
+        }
+    }
+}
+
+fn canonical_hash<T: serde::Serialize>(value: &T) -> [u8; 32] {
+    let config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding()
+        .with_limit::<MAX_ENCODING_BYTES>();
+    let bytes = encode_to_vec(value, config).expect("serialization failed");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    hasher.finalize().into()
+}
 
 // TODO: turn this into a reliable broadcast crate
 // - instead of Vec of LedgerDiff, allow it to be generic over some value T
