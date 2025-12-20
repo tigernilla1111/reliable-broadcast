@@ -5,7 +5,10 @@ type PubId = u64;
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct UserId(PubId);
 impl UserId {
-    pub fn new() -> Self {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+    pub fn random() -> Self {
         Self(rand::rng().random())
     }
 }

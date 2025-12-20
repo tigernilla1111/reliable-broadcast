@@ -119,12 +119,12 @@ impl<T> Data for T where
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct MsgLink<T> {
-    sender: SocketAddr,
+    sender: UserId,
     msg_id: MsgLinkId,
     pub data: T,
 }
 impl<T> MsgLink<T> {
-    pub fn new(sender: SocketAddr, msg_id: MsgLinkId, data: T) -> Self {
+    pub fn new(sender: UserId, msg_id: MsgLinkId, data: T) -> Self {
         Self {
             sender,
             msg_id,
@@ -151,6 +151,8 @@ pub fn create_msg_link_rpc_module<T: Data>(registry: Registry<T>) -> jsonrpsee::
 pub struct Interface<T> {
     /// My IpAddr
     pub addr: SocketAddr,
+    pub pubkey: UserId,
+    addr_book: Arc<Mutex<HashMap<UserId, SocketAddr>>>,
     /// Stores clients so I don't have to recreate them for each outgoing connection
     clients: Arc<Mutex<HashMap<SocketAddr, Arc<HttpClient>>>>,
     pub registry: Registry<T>,
@@ -170,6 +172,8 @@ impl<T: Data> Interface<T> {
             addr,
             clients: Arc::new(Mutex::new(HashMap::new())),
             registry: registry.clone(),
+            pubkey: UserId::random(),
+            addr_book: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let server_handle = server.start(create_msg_link_rpc_module(registry));
@@ -180,10 +184,12 @@ impl<T: Data> Interface<T> {
     }
 
     /// Registers the msg_link_id in the registry before sending
-    pub async fn send_msg(&self, rcvr: &SocketAddr, msg_data: T, msg_link_id: MsgLinkId) {
+    pub async fn send_msg(&self, rcvr: &UserId, msg_data: &T, msg_link_id: MsgLinkId) {
+        let addr_book = self.addr_book.lock().await;
+        let rcvr = addr_book.get(rcvr).unwrap();
         println!("{}, sending msg to {:?}, {:?}", self.addr, rcvr, msg_data);
         let client = self.connect(rcvr).await;
-        let msg_link = MsgLink::new(self.addr, msg_link_id, msg_data);
+        let msg_link = MsgLink::new(self.pubkey, msg_link_id, msg_data.to_owned());
         self.registry.register(msg_link_id).await;
         client.msg(msg_link).await.unwrap();
     }
@@ -207,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn interface_test() {
         let iface1 = Interface::new("127.0.0.1:0").await;
-        let addr1 = iface1.addr;
+        let user_id1 = UserId::new(1);
         let msg_id = MsgLinkId::new(68);
 
         let mut rx = iface1.registry.subscribe(msg_id.clone()).await.unwrap();
@@ -220,8 +226,13 @@ mod tests {
         });
 
         let iface2: Arc<Interface<String>> = Interface::new("127.0.0.1:0").await;
+        let user_id2 = UserId::new(2);
+
+        // Add user_id1 -> iface1.addr mapping to iface2's addr_book
+        iface2.addr_book.lock().await.insert(user_id1, iface1.addr);
+
         let msg_data = "test_data_1".to_string();
-        iface2.send_msg(&addr1, msg_data, msg_id.clone()).await;
+        iface2.send_msg(&user_id1, &msg_data, msg_id.clone()).await;
     }
 
     #[tokio::test]
@@ -242,7 +253,7 @@ mod tests {
     async fn registry_send_before_subscribe() {
         let registry = Registry::new();
         let msg_id = MsgLinkId::new(789);
-        let sender = "192.0.2.1:0".parse().unwrap();
+        let sender = UserId::new(100);
 
         let msg = MsgLink::new(sender, msg_id, "test_message".to_string());
 
@@ -269,12 +280,17 @@ mod tests {
         let iface1: Arc<Interface<String>> = Interface::new("127.0.0.1:0").await;
         let iface2 = Interface::new("127.0.0.1:0").await;
 
+        let user_id1 = UserId::new(10);
+        let user_id2 = UserId::new(20);
+
+        // Add user_id2 -> iface2.addr mapping to iface1's addr_book
+        iface1.addr_book.lock().await.insert(user_id2, iface2.addr);
         // Exchange address
         let msg_id = MsgLinkId::new(987);
         let msg_data = "buffered_test_data".to_string();
 
         // Send BEFORE iface2 subscribes or registers
-        iface1.send_msg(&iface2.addr, msg_data, msg_id).await;
+        iface1.send_msg(&user_id2, &msg_data, msg_id).await;
 
         // Now iface2 subscribes AFTER the message arrived
         let mut rx = iface2
@@ -296,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn registry_multiple_msglinkids_interleaved_no_signature_usage() {
         let registry = Registry::new();
-        let sender = "192.0.2.1:0".parse().unwrap();
+        let sender = UserId::new(200);
 
         let msg_id_a = MsgLinkId::new(222);
         let msg_id_b = MsgLinkId::new(333);
@@ -357,16 +373,23 @@ mod tests {
         let iface2: Arc<Interface<String>> = Interface::new("127.0.0.1:0").await;
         let iface3: Arc<Interface<String>> = Interface::new("127.0.0.1:0").await;
 
+        let user_id1 = iface1.pubkey;
+        let user_id2 = iface2.pubkey;
+        let user_id3 = iface3.pubkey;
+
+        // Add user_id1 -> iface1.addr mapping to iface2 and iface3's addr_books
+        iface2.addr_book.lock().await.insert(user_id1, iface1.addr);
+        iface3.addr_book.lock().await.insert(user_id1, iface1.addr);
         let msg_id = MsgLinkId::new(555);
         let mut rx = iface1.registry.subscribe(msg_id).await.unwrap();
 
         // Two different clients send to the same msg_id
         iface2
-            .send_msg(&iface1.addr, "test_from_client2".to_string(), msg_id)
+            .send_msg(&user_id1, &"test_from_client2".to_string(), msg_id)
             .await;
 
         iface3
-            .send_msg(&iface1.addr, "test_from_client3".to_string(), msg_id)
+            .send_msg(&user_id1, &"test_from_client3".to_string(), msg_id)
             .await;
 
         // Should receive both messages
@@ -381,15 +404,16 @@ mod tests {
             .expect("channel closed");
 
         // Verify both messages arrived (order may vary)
-        let addrs: Vec<_> = vec![msg1.sender, msg2.sender];
-        assert!(addrs.contains(&iface2.addr));
-        assert!(addrs.contains(&iface3.addr));
+        let senders: Vec<_> = vec![msg1.sender, msg2.sender];
+        assert!(senders.contains(&user_id2));
+        assert!(senders.contains(&user_id3));
     }
+
     #[tokio::test]
     async fn registry_channel_overflow_behavior() {
         let registry = Registry::new();
         let msg_id = MsgLinkId::new(444);
-        let sender = "192.0.2.1:0".parse().unwrap();
+        let sender = UserId::new(300);
 
         registry.register(msg_id).await;
 
