@@ -24,6 +24,8 @@ struct BcastInstance<T> {
     /// How may Ready messages received for a specific hash
     hash_ready_count: HashMap<DataHashOutput, usize>,
     is_ready_msg_sent: bool,
+    /// Did the broadcast finalize a value ie did it get >= quorom Ready messages
+    is_bcast_finalized: bool,
 }
 impl<T> BcastInstance<T> {
     fn new(
@@ -39,6 +41,7 @@ impl<T> BcastInstance<T> {
             hash_echo_count: HashMap::new(),
             hash_ready_count: HashMap::new(),
             is_ready_msg_sent: false,
+            is_bcast_finalized: false,
         }
     }
     fn get_quorum(&self) -> usize {
@@ -55,33 +58,25 @@ enum BroadcastRound<T> {
     Ready(MsgLinkId, UserId, [u8; 32]),
 }
 /// Start a reliable broadcast
-// async fn broadcast_init<T: Data>(
-//     iface: Interface<BroadcastRound<T>>,
-//     bcast_state: BcastState<T>,
-//     recipients: Vec<SocketAddr>,
-//     data: T,
-//     msg_link_id: MsgLinkId,
-// ) {
-//     let data = BroadcastRound::Init(msg_link_id, data);
-//     let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
-//     for rcvr in recipients.iter() {
-//         iface.send_msg(rcvr, data.clone(), msg_link_id).await;
-//     }
-//     let mut rx = iface.registry.subscribe(msg_link_id).await.unwrap();
-//     while let Some(msg) = rx.recv().await {
-//         match msg.data {
-//             BroadcastRound::Init(_, _) => {
-//                 // do nothing here and maybe even report user because we should be
-//                 panic!("should not have received an Init message if I am the intiator");
-//             }
-//             BroadcastRound::Echo(_, _) => {}
-//             BroadcastRound::Ready(_, _) => {}
-//         }
-//     }
-// }
+async fn broadcast_init<T: Data>(
+    iface: Interface<BroadcastRound<T>>,
+    bcast_state: &mut BcastState<T>,
+    recipients: Vec<UserId>,
+    data: T,
+    msg_link_id: MsgLinkId,
+) -> Result<T, String> {
+    let data = BroadcastRound::Init(msg_link_id, iface.pubkey, data, recipients.clone());
+    let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
+    for rcvr in recipients.iter() {
+        iface.send_msg(rcvr, &data, msg_link_id).await;
+    }
+    // need to set up init state here because iniator wont receive init RPC (from himself)
+    participate_in_broadcast(&iface, bcast_state, msg_link_id).await
+}
+
 /// function to run to participate as a recipient of a reliable broadcast
 async fn participate_in_broadcast<T: Data>(
-    iface: Interface<BroadcastRound<T>>,
+    iface: &Interface<BroadcastRound<T>>,
     bcast_state: &mut BcastState<T>,
     msg_link_id: MsgLinkId,
 ) -> Result<T, String> {
@@ -109,6 +104,7 @@ async fn participate_in_broadcast<T: Data>(
                 iface.send_msg(participant, &echo_msg, msg_link_id).await;
             }
             break;
+        // Add message to queue to be processed after the init message
         } else {
             msg_queue.push(msg);
         }
@@ -117,43 +113,68 @@ async fn participate_in_broadcast<T: Data>(
         panic!("channel closed without receiving init");
     };
     // iterate through the queued messages
-    for msg in msg_queue.iter() {
-        match msg.data {
-            BroadcastRound::Echo(msg_link_id, sender, hash) => {
-                let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
-                *num_hashes += 1;
-
-                // mark flag to not send multiple readies out and send Ready out
-                if *num_hashes >= bcast_instance.get_quorum() && !bcast_instance.is_ready_msg_sent {
-                    bcast_instance.is_ready_msg_sent = true;
-                    let rdy_msg = BroadcastRound::Ready(msg_link_id, iface.pubkey, hash);
-                    for participant in bcast_instance.participants.iter() {
-                        if participant == &iface.pubkey {
-                            continue;
-                        }
-                        iface.send_msg(participant, &rdy_msg, msg_link_id).await;
-                    }
-                }
-            }
-            BroadcastRound::Ready(msg_link_id, sender, hash) => {
-                let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
-                *num_hashes += 1;
-
-                if *num_hashes >= bcast_instance.get_quorum() {
-                    // drop receiver
-                    return Ok(bcast_instance.payload);
-                }
-            }
-            _ => {
-                panic!("should not have any more init messages to process for {msg_link_id:?}")
-            }
+    for msg in msg_queue {
+        handle_msg_data(msg, &mut bcast_instance, iface).await;
+        if bcast_instance.is_bcast_finalized {
+            return Ok(bcast_instance.payload);
         }
     }
-    // drop receiver
+    // iterate through all other received messages
+    while let Some(msg) = rx.recv().await {
+        handle_msg_data(msg, &mut bcast_instance, &iface).await;
+        if bcast_instance.is_bcast_finalized {
+            return Ok(bcast_instance.payload);
+        }
+    }
+    // Drop receiver
+    drop(rx);
+
     Err("no".to_string())
 }
 
-fn handle_msg_data<T>(msg: &MsgLink<BroadcastRound<T>>) {}
+async fn handle_msg_data<T: Data>(
+    msg: MsgLink<BroadcastRound<T>>,
+    bcast_instance: &mut BcastInstance<T>,
+    iface: &Interface<BroadcastRound<T>>,
+) {
+    if bcast_instance.is_bcast_finalized {
+        return;
+    }
+    match msg.data {
+        BroadcastRound::Echo(msg_link_id, sender, hash) => {
+            // we can stop counting echos if the Ready message has been sent out already
+            if bcast_instance.is_ready_msg_sent {
+                return;
+            }
+            let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
+            *num_hashes += 1;
+
+            // Send Ready out and mark flag to not send multiple Ready(s) out
+            if *num_hashes >= bcast_instance.get_quorum() {
+                bcast_instance.is_ready_msg_sent = true;
+                let rdy_msg = BroadcastRound::Ready(msg_link_id, iface.pubkey, hash);
+                for participant in bcast_instance.participants.iter() {
+                    if participant == &iface.pubkey {
+                        continue;
+                    }
+                    iface.send_msg(participant, &rdy_msg, msg_link_id).await;
+                }
+            }
+        }
+        BroadcastRound::Ready(msg_link_id, sender, hash) => {
+            let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
+            *num_hashes += 1;
+            if *num_hashes >= bcast_instance.get_quorum() {
+                // drop receiver
+                bcast_instance.is_bcast_finalized = true;
+                // return Ok(bcast_instance.payload);
+            }
+        }
+        BroadcastRound::Init(_, _, _, _) => {
+            panic!("should not have any more init messages to process");
+        }
+    }
+}
 
 fn canonical_hash<T: serde::Serialize>(value: &T) -> [u8; 32] {
     let config = bincode::config::standard()
