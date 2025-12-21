@@ -7,7 +7,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio;
 use tokio::net::ToSocketAddrs;
 
-use crate::types::{LedgerDiff, Signature, UserId};
+use crate::types::{Signature, UserId};
 // use jsonrpsee::core::middleware::RequestBodyLimitLayer;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::server::ServerBuilder;
@@ -95,9 +95,9 @@ impl<T> Registry<T> {
         }
         return Err(format!("no active channel for {:?}", msg.get_msg_id()));
     }
-    pub async fn remove(&self, msg_id: MsgLinkId) {
-        self.msg_channel_map.lock().await.remove(&msg_id);
-    }
+    // pub async fn remove(&self, msg_id: MsgLinkId) {
+    //     self.msg_channel_map.lock().await.remove(&msg_id);
+    // }
 }
 
 use api::{MsgLinkServer, MyRpcClient, MyRpcServer};
@@ -187,7 +187,7 @@ impl<T: Data> Interface<T> {
     pub async fn send_msg(&self, rcvr: &UserId, msg_data: &T, msg_link_id: MsgLinkId) {
         let addr_book = self.addr_book.lock().await;
         let rcvr = addr_book.get(rcvr).unwrap();
-        println!("{}, sending msg to {:?}, {:?}", self.addr, rcvr, msg_data);
+        // println!("{}, sending msg to {:?}, {:?}", self.addr, rcvr, msg_data);
         let client = self.connect(rcvr).await;
         let msg_link = MsgLink::new(self.pubkey, msg_link_id, msg_data.to_owned());
         self.registry.register(msg_link_id).await;
@@ -201,6 +201,9 @@ impl<T: Data> Interface<T> {
             Arc::new(HttpClientBuilder::default().build(&server_url).unwrap())
         });
         client.clone()
+    }
+    pub async fn add_addr(&self, pubkey: UserId, addr: SocketAddr) {
+        self.addr_book.lock().await.insert(pubkey, addr);
     }
 }
 

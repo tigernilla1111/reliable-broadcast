@@ -20,16 +20,3 @@ impl Deref for UserId {
 }
 
 pub type Signature = String;
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct CreatePost {
-    poster: UserId,
-    msg: String,
-    sig: Signature,
-}
-
-/// LedgerDiffs are different state changes that can be applied to the ledger
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub enum LedgerDiff {
-    CreatePost(CreatePost),
-}
