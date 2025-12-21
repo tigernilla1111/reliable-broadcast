@@ -17,8 +17,9 @@ struct BcastInstance<T> {
     /// How may Ready messages received for a specific hash
     hash_ready_count: HashMap<DataHashOutput, usize>,
     is_ready_msg_sent: bool,
+    is_echo_quorum_reached: bool,
     /// Did the broadcast finalize a value ie did it get >= quorom Ready messages
-    is_bcast_finalized: bool,
+    is_rdy_quorum_reached: bool,
     /// includes the initiator
     participants: Vec<UserId>,
     payload: Option<T>,
@@ -31,7 +32,8 @@ impl<T> BcastInstance<T> {
             hash_echo_count: HashMap::new(),
             hash_ready_count: HashMap::new(),
             is_ready_msg_sent: false,
-            is_bcast_finalized: false,
+            is_echo_quorum_reached: false,
+            is_rdy_quorum_reached: false,
             participants: Vec::new(),
             payload: None,
         }
@@ -42,12 +44,12 @@ impl<T> BcastInstance<T> {
 }
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 enum BroadcastRound<T> {
-    /// (MsgLinkId, Initiator, Data, Participants)
-    Init(MsgLinkId, UserId, T, Vec<UserId>),
-    /// MsgLinkId,  Sender, Hash
-    Echo(MsgLinkId, UserId, DataHashOutput),
-    /// MsgLinkId,  Sender, Hash
-    Ready(MsgLinkId, UserId, DataHashOutput),
+    /// (Initiator, Data, Participants)
+    Init(UserId, T, Vec<UserId>),
+    /// Sender, Hash
+    Echo(UserId, DataHashOutput),
+    /// Sender, Hash
+    Ready(UserId, DataHashOutput),
 }
 /// Start a reliable broadcast and participate in it
 async fn broadcast_init<T: Data>(
@@ -57,7 +59,7 @@ async fn broadcast_init<T: Data>(
     data: T,
     msg_link_id: MsgLinkId,
 ) -> Result<T, String> {
-    let msg = BroadcastRound::Init(msg_link_id, iface.pubkey, data.clone(), recipients.clone());
+    let msg = BroadcastRound::Init(iface.pubkey, data.clone(), recipients.clone());
     let sig: Signature = "sign(msg_data||msg_link_id||SEND)".to_string();
     for rcvr in recipients.iter() {
         iface.send_msg(rcvr, &msg, msg_link_id).await;
@@ -81,15 +83,14 @@ async fn participate_in_broadcast<T: Data>(
     // TODO: do all message handling in this loop
     while let Some(msg) = rx.recv().await {
         match msg.data {
-            BroadcastRound::Init(_, _, data, participants) => {
+            BroadcastRound::Init(_, data, participants) => {
                 // TODO: check for multiple init messages
                 let hash = canonical_hash(&data);
                 bcast_instance.participants = participants;
                 bcast_instance.payload = Some(data);
 
                 // Send out echo
-                let echo_msg: BroadcastRound<T> =
-                    BroadcastRound::Echo(msg_link_id, iface.pubkey, hash);
+                let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(iface.pubkey, hash);
                 for participant in bcast_instance.participants.iter() {
                     if participant == &iface.pubkey {
                         continue;
@@ -102,14 +103,15 @@ async fn participate_in_broadcast<T: Data>(
                 // send out Ready if quorum is reached
                 if let Some(&echo_count) = bcast_instance.hash_echo_count.get(&hash) {
                     if echo_count >= quorum {
-                        bcast_instance.is_ready_msg_sent = true;
-                        let rdy_msg = BroadcastRound::Ready(msg_link_id, iface.pubkey, hash);
+                        bcast_instance.is_echo_quorum_reached = true;
+                        let rdy_msg = BroadcastRound::Ready(iface.pubkey, hash);
                         for participant in bcast_instance.participants.iter() {
                             if participant == &iface.pubkey {
                                 continue;
                             }
                             iface.send_msg(participant, &rdy_msg, msg_link_id).await;
                         }
+                        bcast_instance.is_ready_msg_sent = true;
                     }
                 }
                 // deliver message if quorum is reached
@@ -121,13 +123,26 @@ async fn participate_in_broadcast<T: Data>(
                     }
                 }
             }
-            _ => {
-                handle_msg_data(msg, &mut bcast_instance, iface).await;
-                // If init message hasnt been processed, cant check quorum
-                if bcast_instance.payload.is_none() {
+            BroadcastRound::Echo(_sender, hash) => {
+                // Skip all counting logic if we've already sent out Ready
+                if bcast_instance.is_ready_msg_sent {
                     continue;
                 }
-                if bcast_instance.is_bcast_finalized {
+                count_echo(&mut bcast_instance, iface, hash, msg_link_id).await;
+                if bcast_instance.is_echo_quorum_reached {
+                    let rdy_msg = BroadcastRound::Ready(iface.pubkey, hash);
+                    for participant in bcast_instance.participants.iter() {
+                        if participant == &iface.pubkey {
+                            continue;
+                        }
+                        iface.send_msg(participant, &rdy_msg, msg_link_id).await;
+                    }
+                    bcast_instance.is_ready_msg_sent = true;
+                }
+            }
+            BroadcastRound::Ready(_sender, hash) => {
+                count_ready(&mut bcast_instance, hash).await;
+                if bcast_instance.is_rdy_quorum_reached {
                     return bcast_instance
                         .payload
                         .ok_or("Payload not initialized".to_string());
@@ -141,53 +156,33 @@ async fn participate_in_broadcast<T: Data>(
     Err("no".to_string())
 }
 
-async fn handle_msg_data<T: Data>(
-    msg: MsgLink<BroadcastRound<T>>,
+async fn count_echo<T: Data>(
     bcast_instance: &mut BcastInstance<T>,
     iface: &Interface<BroadcastRound<T>>,
+    hash: DataHashOutput,
+    msg_link_id: MsgLinkId,
 ) {
-    if bcast_instance.is_bcast_finalized {
+    let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
+    *num_hashes += 1;
+    // Can't check quorum if Init message hasnt been processed
+    if bcast_instance.payload.is_none() {
         return;
     }
-    match msg.data {
-        BroadcastRound::Echo(msg_link_id, sender, hash) => {
-            // we can stop counting echos if the Ready message has been sent out already
-            if bcast_instance.is_ready_msg_sent {
-                return;
-            }
-            let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
-            *num_hashes += 1;
-            // Can't check quorum if Init message hasnt been processed
-            if bcast_instance.payload.is_none() {
-                return;
-            }
 
-            // Send Ready out and mark flag to not send multiple Ready(s) out
-            if *num_hashes >= bcast_instance.get_quorum() {
-                bcast_instance.is_ready_msg_sent = true;
-                let rdy_msg = BroadcastRound::Ready(msg_link_id, iface.pubkey, hash);
-                for participant in bcast_instance.participants.iter() {
-                    if participant == &iface.pubkey {
-                        continue;
-                    }
-                    iface.send_msg(participant, &rdy_msg, msg_link_id).await;
-                }
-            }
-        }
-        BroadcastRound::Ready(msg_link_id, sender, hash) => {
-            let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
-            *num_hashes += 1;
-            // Can't check quorum if Init message hasnt been processed
-            if bcast_instance.payload.is_none() {
-                return;
-            }
-            if *num_hashes >= bcast_instance.get_quorum() {
-                bcast_instance.is_bcast_finalized = true;
-            }
-        }
-        BroadcastRound::Init(_, _, _, _) => {
-            panic!("should not have any more init messages to process");
-        }
+    // Send Ready out and mark flag to not send multiple Ready(s) out
+    if *num_hashes >= bcast_instance.get_quorum() {
+        bcast_instance.is_echo_quorum_reached = true;
+    }
+}
+async fn count_ready<T: Data>(bcast_instance: &mut BcastInstance<T>, hash: DataHashOutput) {
+    let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
+    *num_hashes += 1;
+    // Can't check quorum if Init message hasnt been processed
+    if bcast_instance.payload.is_none() {
+        return;
+    }
+    if *num_hashes >= bcast_instance.get_quorum() {
+        bcast_instance.is_rdy_quorum_reached = true;
     }
 }
 
@@ -207,17 +202,13 @@ mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
 
-    // ============================================================================
-    // BASIC SANITY CHECKS
-    // ============================================================================
-
     #[test]
     fn bcast_instance_new() {
         let instance: BcastInstance<String> = BcastInstance::new();
         assert!(instance.hash_echo_count.is_empty());
         assert!(instance.hash_ready_count.is_empty());
         assert!(!instance.is_ready_msg_sent);
-        assert!(!instance.is_bcast_finalized);
+        assert!(!instance.is_rdy_quorum_reached);
         assert!(instance.participants.is_empty());
         assert!(instance.payload.is_none());
     }
@@ -294,12 +285,11 @@ mod tests {
 
     #[test]
     fn broadcast_round_init_serialization() {
-        let msg_id = MsgLinkId::new(1);
         let initiator = UserId::new(100);
         let data = "test_payload".to_string();
         let participants = vec![UserId::new(1), UserId::new(2), UserId::new(3)];
 
-        let round = BroadcastRound::Init(msg_id, initiator, data, participants);
+        let round = BroadcastRound::Init(initiator, data, participants);
 
         // Test that it can be serialized and deserialized
         let config = bincode::config::standard();
@@ -309,8 +299,7 @@ mod tests {
             .0;
 
         match decoded {
-            BroadcastRound::Init(id, init, payload, parts) => {
-                assert_eq!(id, msg_id);
+            BroadcastRound::Init(init, payload, parts) => {
                 assert_eq!(init, initiator);
                 assert_eq!(payload, "test_payload");
                 assert_eq!(parts.len(), 3);
@@ -321,11 +310,10 @@ mod tests {
 
     #[test]
     fn broadcast_round_echo_serialization() {
-        let msg_id = MsgLinkId::new(2);
         let sender = UserId::new(200);
         let hash = [42u8; 32];
 
-        let round: BroadcastRound<String> = BroadcastRound::Echo(msg_id, sender, hash);
+        let round: BroadcastRound<String> = BroadcastRound::Echo(sender, hash);
 
         let config = bincode::config::standard();
         let encoded = bincode::serde::encode_to_vec(&round, config).unwrap();
@@ -334,8 +322,7 @@ mod tests {
             .0;
 
         match decoded {
-            BroadcastRound::Echo(id, s, h) => {
-                assert_eq!(id, msg_id);
+            BroadcastRound::Echo(s, h) => {
                 assert_eq!(s, sender);
                 assert_eq!(h, hash);
             }
@@ -345,11 +332,10 @@ mod tests {
 
     #[test]
     fn broadcast_round_ready_serialization() {
-        let msg_id = MsgLinkId::new(3);
         let sender = UserId::new(300);
         let hash = [99u8; 32];
 
-        let round: BroadcastRound<String> = BroadcastRound::Ready(msg_id, sender, hash);
+        let round: BroadcastRound<String> = BroadcastRound::Ready(sender, hash);
 
         let config = bincode::config::standard();
         let encoded = bincode::serde::encode_to_vec(&round, config).unwrap();
@@ -358,8 +344,7 @@ mod tests {
             .0;
 
         match decoded {
-            BroadcastRound::Ready(id, s, h) => {
-                assert_eq!(id, msg_id);
+            BroadcastRound::Ready(s, h) => {
                 assert_eq!(s, sender);
                 assert_eq!(h, hash);
             }
@@ -422,7 +407,7 @@ mod tests {
             iface.add_addr(user2, iface2.addr).await;
             iface.add_addr(user3, iface3.addr).await;
         }
-        
+
         let msg_link_id = MsgLinkId::new(100);
         let broadcast_data = "Important broadcast message".to_string();
         let participants = vec![user0, user1, user2, user3];
@@ -514,7 +499,7 @@ mod tests {
 
         // Send an Echo message to node 1 before the Init arrives
         let data_hash = canonical_hash(&broadcast_data);
-        let early_echo = BroadcastRound::Echo(msg_link_id, user2, data_hash);
+        let early_echo = BroadcastRound::Echo(user2, data_hash);
 
         iface2.send_msg(&user1, &early_echo, msg_link_id).await;
 
@@ -583,13 +568,15 @@ mod tests {
     async fn broadcast_stress_test_many_concurrent_broadcasts() {
         // Run a lot of broadcasts at once to stress test the system.
         // 10 nodes each starting 5 broadcasts = 50 total concurrent broadcasts.
-        
+
         const NUM_NODES: usize = 10;
         const BROADCASTS_PER_NODE: usize = 5;
 
         println!(
             "Starting stress test: {} nodes, {} broadcasts per node, {} total",
-            NUM_NODES, BROADCASTS_PER_NODE, NUM_NODES * BROADCASTS_PER_NODE
+            NUM_NODES,
+            BROADCASTS_PER_NODE,
+            NUM_NODES * BROADCASTS_PER_NODE
         );
 
         // Create all the nodes
@@ -813,7 +800,7 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00,
             ];
 
-            let malicious_echo = BroadcastRound::Echo(msg_link_id, user4, fake_hash);
+            let malicious_echo = BroadcastRound::Echo(user4, fake_hash);
 
             for target in [user0, user1, user2, user3].iter() {
                 iface4_for_attack

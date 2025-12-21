@@ -1,7 +1,6 @@
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::proc_macros::rpc;
 use std::collections::HashMap;
-use std::fmt::format;
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio;
@@ -229,7 +228,6 @@ mod tests {
         });
 
         let iface2: Arc<Interface<String>> = Interface::new("127.0.0.1:0").await;
-        let user_id2 = UserId::new(2);
 
         // Add user_id1 -> iface1.addr mapping to iface2's addr_book
         iface2.addr_book.lock().await.insert(user_id1, iface1.addr);
@@ -283,7 +281,6 @@ mod tests {
         let iface1: Arc<Interface<String>> = Interface::new("127.0.0.1:0").await;
         let iface2 = Interface::new("127.0.0.1:0").await;
 
-        let user_id1 = UserId::new(10);
         let user_id2 = UserId::new(20);
 
         // Add user_id2 -> iface2.addr mapping to iface1's addr_book
