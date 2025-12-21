@@ -65,9 +65,18 @@ async fn broadcast_init<T: Data>(
         iface.send_msg(rcvr, &msg, msg_link_id).await;
     }
     // need to set up init state here because iniator wont receive init RPC (from himself)
+    let hash = canonical_hash(&data);
     let mut bcast_instance = BcastInstance::new();
     bcast_instance.participants = recipients;
     bcast_instance.payload = Some(data);
+    // Send out echo
+    let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(iface.pubkey, hash);
+    for participant in bcast_instance.participants.iter() {
+        if participant == &iface.pubkey {
+            continue;
+        }
+        iface.send_msg(participant, &echo_msg, msg_link_id).await;
+    }
     participate_in_broadcast(&iface, Some(bcast_instance), msg_link_id).await
 }
 
@@ -863,5 +872,105 @@ mod tests {
         println!("Byzantine fault tolerance verified");
         println!("All nodes delivered the correct message despite the malicious node");
         println!("Configuration: quorum 3/5, honest nodes 4/5, Byzantine nodes 1/5");
+    }
+    #[tokio::test]
+    async fn broadcast_large_number_of_honest_recipients() {
+        // Test a single broadcast with many honest recipients to verify
+        // the protocol scales correctly with participant count
+
+        const NUM_NODES: usize = 50;
+
+        println!("Testing broadcast with {} honest nodes", NUM_NODES);
+
+        // Create all the nodes
+        let mut interfaces = Vec::new();
+        let mut user_ids = Vec::new();
+
+        for _ in 0..NUM_NODES {
+            let iface: Arc<Interface<BroadcastRound<String>>> = Interface::new("127.0.0.1:0").await;
+            user_ids.push(iface.pubkey);
+            interfaces.push(iface);
+        }
+
+        // Set up address books
+        println!("Setting up address books for {} nodes...", NUM_NODES);
+        for iface in interfaces.iter() {
+            for (idx, user_id) in user_ids.iter().enumerate() {
+                iface.add_addr(*user_id, interfaces[idx].addr).await;
+            }
+        }
+
+        let msg_link_id = MsgLinkId::new(500);
+        let broadcast_data = "msg".to_string();
+        let participants = user_ids.clone();
+
+        println!("Starting broadcast from node 0 to {} recipients", NUM_NODES);
+
+        // Node 0 initiates
+        let iface0 = interfaces[0].clone();
+        let data_clone = broadcast_data.clone();
+        let participants_clone = participants.clone();
+        let initiator_task = tokio::spawn(async move {
+            broadcast_init(&*iface0, participants_clone, data_clone, msg_link_id).await
+        });
+
+        // All other nodes participate
+        let mut participant_tasks = Vec::new();
+        for i in 1..NUM_NODES {
+            let iface = interfaces[i].clone();
+            let task =
+                tokio::spawn(
+                    async move { participate_in_broadcast(&iface, None, msg_link_id).await },
+                );
+            participant_tasks.push(task);
+        }
+
+        println!("Waiting for all {} nodes to complete...", NUM_NODES);
+
+        let timeout_duration = Duration::from_secs(100);
+
+        // Check initiator
+        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+            .await
+            .expect("Node 0 timed out")
+            .expect("Node 0 task panicked")
+            .expect("Node 0 broadcast failed");
+
+        assert_eq!(result0, broadcast_data);
+        println!("initiator checked");
+
+        // Check all participants
+        let mut successful = 1; // Count initiator
+        for (idx, task) in participant_tasks.into_iter().enumerate() {
+            println!("checking node {idx}");
+            match tokio::time::timeout(timeout_duration, task).await {
+                Ok(Ok(Ok(result))) => {
+                    assert_eq!(result, broadcast_data);
+                    successful += 1;
+                }
+                Ok(Ok(Err(e))) => {
+                    eprintln!("Node {} failed: {}", idx + 1, e);
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Node {} panicked: {:?}", idx + 1, e);
+                }
+                Err(_) => {
+                    eprintln!("Node {} timed out", idx + 1);
+                }
+            }
+        }
+
+        println!(
+            "Successfully delivered to {}/{} nodes",
+            successful, NUM_NODES
+        );
+        println!("Quorum was: {}", (NUM_NODES / 2) + 1);
+
+        assert_eq!(
+            successful, NUM_NODES,
+            "All nodes should successfully deliver"
+        );
+
+        println!("Large scale broadcast test passed");
     }
 }
