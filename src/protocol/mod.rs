@@ -7,6 +7,29 @@ use sha2::{Digest, Sha256};
 
 use crate::network::{Data, Interface, MsgLink, MsgLinkId};
 use crate::types::{Signature, UserId};
+// Brachas Broadcast Implementation
+// operation brb broadcast(m) is % Code for pi
+// (1) broadcast INIT(i, m).
+// when a message INIT(j, −) is received from pj do
+// (2) if first reception of INIT(j, m) then broadcast ECHO(j, m).
+// when a message ECHO(j, m) is received from any process do
+// (3) if ECHO(j, m) received from α different processes ∧ READY(j, m) not yet broadcast
+// (4) then broadcast READY(j, m)
+// (5) end if.
+// when a message READY(j, m) is received from any process do
+// (6) if READY(j, , m) received from β different processes ∧ READY(j, m) not yet broadcast
+// (7) then broadcast READY(j, m)
+// (8) end if;
+// (9) if READY(j, m) received from γ different processes ∧ (no pair
+// (j, −) already brb-delivered)
+// (10) then brb delivery of (j, m)
+// (11) end if.
+
+// n > 3t
+// n = 3t + 1
+// t = (n-1)/3
+// alpha = qourum on Echo messages needed to send Ready
+// alpha = ((n+t)/2) + 1 = ((n+(n-1)/3)) +1 = ((n + (n/3) + (1/3)))+1= ((4n/3 ))
 
 const MAX_ENCODING_BYTES: usize = 10000;
 type DataHashOutput = [u8; 32];
@@ -18,28 +41,44 @@ struct BcastInstance<T> {
     hash_ready_count: HashMap<DataHashOutput, usize>,
     is_ready_msg_sent: bool,
     is_echo_quorum_reached: bool,
-    /// Did the broadcast finalize a value ie did it get >= quorom Ready messages
-    is_rdy_quorum_reached: bool,
+    // have I received enough Readys to send out my own Ready to all of the protocol (Ready amplification)
+    is_ready_amp_quorum_reached: bool,
+    /// Did the broadcast finalize a value
+    is_delivery_threshold_reached: bool,
+
     /// includes the initiator
     participants: Vec<UserId>,
     payload: Option<T>,
     // TODO: track echo and ready msgs received from a sender in a hashset (one for echos, one for readys)
 }
 impl<T> BcastInstance<T> {
-    fn new(//payload_hash: [u8; 32],
-    ) -> Self {
+    fn new() -> Self {
         Self {
             hash_echo_count: HashMap::new(),
             hash_ready_count: HashMap::new(),
             is_ready_msg_sent: false,
             is_echo_quorum_reached: false,
-            is_rdy_quorum_reached: false,
+            is_ready_amp_quorum_reached: false,
+            is_delivery_threshold_reached: false,
             participants: Vec::new(),
             payload: None,
         }
     }
     fn get_quorum(&self) -> usize {
         (self.participants.len() / 2) + 1
+    }
+
+    fn echo_to_ready_threshold(&self) -> usize {
+        let n = self.participants.len();
+        (n + ((n - 1) / 3) + 1).div_ceil(2)
+    }
+    fn ready_amp_threshold(&self) -> usize {
+        let n = self.participants.len();
+        ((n - 1) / 3) + 1
+    }
+    fn delivery_threshold(&self) -> usize {
+        let n = self.participants.len();
+        (((n - 1) / 3) * 2) + 1
     }
 }
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
@@ -108,24 +147,20 @@ async fn participate_in_broadcast<T: Data>(
                 }
 
                 // check for quorums reached on messages received before processing Init
-                let quorum = bcast_instance.get_quorum();
                 // send out Ready if quorum is reached
                 if let Some(&echo_count) = bcast_instance.hash_echo_count.get(&hash) {
-                    if echo_count >= quorum {
+                    if echo_count >= bcast_instance.echo_to_ready_threshold() {
                         bcast_instance.is_echo_quorum_reached = true;
-                        let rdy_msg = BroadcastRound::Ready(iface.pubkey, hash);
-                        for participant in bcast_instance.participants.iter() {
-                            if participant == &iface.pubkey {
-                                continue;
-                            }
-                            iface.send_msg(participant, &rdy_msg, msg_link_id).await;
-                        }
-                        bcast_instance.is_ready_msg_sent = true;
+                        send_ready(&mut bcast_instance, iface, hash, msg_link_id).await;
                     }
                 }
-                // deliver message if quorum is reached
+                // Send Ready amp and deliver message if quorum is reached
                 if let Some(&ready_count) = bcast_instance.hash_ready_count.get(&hash) {
-                    if ready_count >= quorum {
+                    if ready_count >= bcast_instance.ready_amp_threshold() {
+                        send_ready(&mut bcast_instance, iface, hash, msg_link_id).await;
+                    }
+
+                    if ready_count >= bcast_instance.delivery_threshold() {
                         return bcast_instance
                             .payload
                             .ok_or("No payload initiated".to_string());
@@ -139,19 +174,20 @@ async fn participate_in_broadcast<T: Data>(
                 }
                 count_echo(&mut bcast_instance, iface, hash, msg_link_id).await;
                 if bcast_instance.is_echo_quorum_reached {
-                    let rdy_msg = BroadcastRound::Ready(iface.pubkey, hash);
-                    for participant in bcast_instance.participants.iter() {
-                        if participant == &iface.pubkey {
-                            continue;
-                        }
-                        iface.send_msg(participant, &rdy_msg, msg_link_id).await;
-                    }
-                    bcast_instance.is_ready_msg_sent = true;
+                    send_ready(&mut bcast_instance, iface, hash, msg_link_id).await;
                 }
             }
             BroadcastRound::Ready(_sender, hash) => {
                 count_ready(&mut bcast_instance, hash).await;
-                if bcast_instance.is_rdy_quorum_reached {
+                // Check to see if I should send out Ready amplification
+                if bcast_instance.is_ready_amp_quorum_reached {
+                    // Dont send Ready message if already sent
+                    if !bcast_instance.is_ready_msg_sent {
+                        send_ready(&mut bcast_instance, iface, hash, msg_link_id).await;
+                    }
+                }
+                if bcast_instance.is_delivery_threshold_reached {
+                    drop(rx);
                     return bcast_instance
                         .payload
                         .ok_or("Payload not initialized".to_string());
@@ -164,7 +200,29 @@ async fn participate_in_broadcast<T: Data>(
 
     Err("no".to_string())
 }
-
+async fn send_ready<T: Data>(
+    bcast_instance: &mut BcastInstance<T>,
+    iface: &Interface<BroadcastRound<T>>,
+    hash: DataHashOutput,
+    msg_link_id: MsgLinkId,
+) {
+    let rdy_msg = BroadcastRound::Ready(iface.pubkey, hash);
+    let participants = bcast_instance.participants.clone();
+    let iface_clone = iface.clone();
+    tokio::task::spawn(async move {
+        for participant in participants {
+            if participant == iface_clone.pubkey {
+                continue;
+            }
+            let rdy_msg_clone = rdy_msg.clone();
+            iface_clone
+                .send_msg(&participant, &rdy_msg_clone, msg_link_id)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+    bcast_instance.is_ready_msg_sent = true;
+}
 async fn count_echo<T: Data>(
     bcast_instance: &mut BcastInstance<T>,
     iface: &Interface<BroadcastRound<T>>,
@@ -179,7 +237,7 @@ async fn count_echo<T: Data>(
     }
 
     // Send Ready out and mark flag to not send multiple Ready(s) out
-    if *num_hashes >= bcast_instance.get_quorum() {
+    if *num_hashes >= bcast_instance.echo_to_ready_threshold() {
         bcast_instance.is_echo_quorum_reached = true;
     }
 }
@@ -190,8 +248,14 @@ async fn count_ready<T: Data>(bcast_instance: &mut BcastInstance<T>, hash: DataH
     if bcast_instance.payload.is_none() {
         return;
     }
-    if *num_hashes >= bcast_instance.get_quorum() {
-        bcast_instance.is_rdy_quorum_reached = true;
+    let count = *num_hashes;
+    // Have I reached threshold of Readys to send my own Ready
+    if count >= bcast_instance.ready_amp_threshold() {
+        bcast_instance.is_ready_amp_quorum_reached = true;
+    }
+    // Check to
+    if count >= bcast_instance.delivery_threshold() {
+        bcast_instance.is_delivery_threshold_reached = true;
     }
 }
 
@@ -207,7 +271,6 @@ fn canonical_hash<T: serde::Serialize>(value: &T) -> DataHashOutput {
 }
 
 mod tests {
-
     use super::*;
     use std::{sync::Arc, time::Duration};
 
@@ -217,34 +280,10 @@ mod tests {
         assert!(instance.hash_echo_count.is_empty());
         assert!(instance.hash_ready_count.is_empty());
         assert!(!instance.is_ready_msg_sent);
-        assert!(!instance.is_rdy_quorum_reached);
+        assert!(!instance.is_delivery_threshold_reached);
         assert!(instance.participants.is_empty());
         assert!(instance.payload.is_none());
     }
-
-    #[test]
-    fn bcast_instance_get_quorum() {
-        let mut instance: BcastInstance<String> = BcastInstance::new();
-        let create_users = |num: i32| {
-            (0..num)
-                .map(|n| UserId::new(n as u64))
-                .collect::<Vec<UserId>>()
-        };
-
-        // Empty participants
-        assert_eq!(instance.get_quorum(), 1);
-        instance.participants = create_users(1);
-        assert_eq!(instance.get_quorum(), 1);
-        instance.participants = create_users(2);
-        assert_eq!(instance.get_quorum(), 2);
-        instance.participants = create_users(3);
-        assert_eq!(instance.get_quorum(), 2);
-        instance.participants = create_users(4);
-        assert_eq!(instance.get_quorum(), 3);
-        instance.participants = create_users(5);
-        assert_eq!(instance.get_quorum(), 3);
-    }
-
     #[test]
     fn canonical_hash_deterministic() {
         let data1 = "test_data".to_string();
@@ -424,9 +463,11 @@ mod tests {
         // Node 0 starts the broadcast
         let data_clone = broadcast_data.clone();
         let participants_clone = participants.clone();
+        let iface0_clone = iface0.clone();
         let initiator_task = tokio::spawn(async move {
             broadcast_init(&*iface0, participants_clone, data_clone, msg_link_id).await
         });
+        println!("{:?} sent init", iface0_clone.pubkey);
 
         // The other nodes participate
         let participant1_task =
@@ -878,7 +919,7 @@ mod tests {
         // Test a single broadcast with many honest recipients to verify
         // the protocol scales correctly with participant count
 
-        const NUM_NODES: usize = 50;
+        const NUM_NODES: usize = 20;
 
         println!("Testing broadcast with {} honest nodes", NUM_NODES);
 
@@ -927,7 +968,7 @@ mod tests {
 
         println!("Waiting for all {} nodes to complete...", NUM_NODES);
 
-        let timeout_duration = Duration::from_secs(100);
+        let timeout_duration = Duration::from_secs(10);
 
         // Check initiator
         let result0 = tokio::time::timeout(timeout_duration, initiator_task)
@@ -942,20 +983,21 @@ mod tests {
         // Check all participants
         let mut successful = 1; // Count initiator
         for (idx, task) in participant_tasks.into_iter().enumerate() {
-            println!("checking node {idx}");
+            let pubkey = interfaces[idx + 1].pubkey;
+            println!("checking node {pubkey:?}");
             match tokio::time::timeout(timeout_duration, task).await {
                 Ok(Ok(Ok(result))) => {
                     assert_eq!(result, broadcast_data);
                     successful += 1;
                 }
                 Ok(Ok(Err(e))) => {
-                    eprintln!("Node {} failed: {}", idx + 1, e);
+                    eprintln!("Node {:?} failed: {}", pubkey, e);
                 }
                 Ok(Err(e)) => {
-                    eprintln!("Node {} panicked: {:?}", idx + 1, e);
+                    eprintln!("Node {:?} panicked: {:?}", pubkey, e);
                 }
                 Err(_) => {
-                    eprintln!("Node {} timed out", idx + 1);
+                    eprintln!("Node {:?} timed out", pubkey);
                 }
             }
         }

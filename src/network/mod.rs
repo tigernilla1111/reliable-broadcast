@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, mpsc, mpsc::Receiver, mpsc::Sender};
 use tower::limit::ConcurrencyLimitLayer;
 
 // How many DM messages from the network can be stored in the channel
-const MAX_MSGS_PER_LINK_ID: usize = 20;
+const MAX_MSGS_PER_LINK_ID: usize = 10000;
 
 mod api {
     use super::*;
@@ -86,13 +86,19 @@ impl<T> Registry<T> {
         rx.take()
     }
     pub async fn deliver(&self, msg: MsgLink<T>) -> Result<(), String> {
-        if let Some((tx, _)) = self.msg_channel_map.lock().await.get(msg.get_msg_id()) {
-            return tx
-                .send_timeout(msg, Duration::from_millis(100))
-                .await
-                .map_err(|e| e.to_string());
-        }
-        return Err(format!("no active channel for {:?}", msg.get_msg_id()));
+        let Some(tx) = self
+            .msg_channel_map
+            .lock()
+            .await
+            .get(msg.get_msg_id())
+            .map(|(tx, _)| tx.clone())
+        else {
+            return Err(format!("no active channel for {:?}", msg.get_msg_id()));
+        };
+        return tx
+            .send_timeout(msg, Duration::from_secs(1))
+            .await
+            .map_err(|e| e.to_string());
     }
     // pub async fn remove(&self, msg_id: MsgLinkId) {
     //     self.msg_channel_map.lock().await.remove(&msg_id);
@@ -147,6 +153,7 @@ pub fn create_msg_link_rpc_module<T: Data>(registry: Registry<T>) -> jsonrpsee::
     // `into_rpc()` method was generated inside of the `RpcServer` trait under the hood.
     server_impl.into_rpc().remove_context()
 }
+#[derive(Clone)]
 pub struct Interface<T> {
     /// My IpAddr
     pub addr: SocketAddr,
