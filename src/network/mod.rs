@@ -144,6 +144,12 @@ impl MsgLinkId {
         Self(id)
     }
 }
+impl std::ops::Deref for MsgLinkId {
+    type Target = u128;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 pub fn create_msg_link_rpc_module<T: Data>(registry: Registry<T>) -> jsonrpsee::RpcModule<()> {
     let server_impl = MsgLinkServer::new(registry);
@@ -193,7 +199,6 @@ impl<T: Data> Interface<T> {
         // println!("{}, sending msg to {:?}, {:?}", self.addr, rcvr, msg_data);
         let client = self.connect(rcvr).await;
         let msg_link = MsgLink::new(self.pubkey, msg_link_id, msg_data.to_owned());
-        self.registry.register(msg_link_id).await;
         client.msg(msg_link).await.unwrap();
     }
 

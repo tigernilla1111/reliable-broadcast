@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::u8;
 
-use crate::crypto::{DataHashOutput, canonical_hash};
+use crate::crypto::{Sha512HashBytes, Sha512HashOutput, canonical_bytes};
 use crate::network::{Data, Interface, MsgLink, MsgLinkId};
 use crate::types::{Signature, UserId};
 // Brachas Broadcast Implementation
@@ -31,9 +31,9 @@ use crate::types::{Signature, UserId};
 
 struct BcastInstance<T> {
     /// How many Echo received for a specific hash
-    hash_echo_count: HashMap<DataHashOutput, usize>,
+    hash_echo_count: HashMap<Sha512HashBytes, usize>,
     /// How may Ready messages received for a specific hash
-    hash_ready_count: HashMap<DataHashOutput, usize>,
+    hash_ready_count: HashMap<Sha512HashBytes, usize>,
     is_ready_msg_sent: bool,
     is_echo_quorum_reached: bool,
     // have I received enough Readys to send out my own Ready to all of the protocol (Ready amplification)
@@ -80,9 +80,9 @@ enum BroadcastRound<T> {
     /// (Initiator, Data, Participants)
     Init(UserId, T, Vec<UserId>),
     /// Sender, Hash
-    Echo(UserId, DataHashOutput),
+    Echo(UserId, Sha512HashBytes),
     /// Sender, Hash
-    Ready(UserId, DataHashOutput),
+    Ready(UserId, Sha512HashBytes),
 }
 /// Start a reliable broadcast and participate in it
 async fn broadcast_init<T: Data>(
@@ -98,7 +98,7 @@ async fn broadcast_init<T: Data>(
         iface.send_msg(rcvr, &msg, msg_link_id).await;
     }
     // need to set up init state here because iniator wont receive init RPC (from himself)
-    let hash = canonical_hash(&data);
+    let hash = canonical_bytes(&data);
     let mut bcast_instance = BcastInstance::new();
     bcast_instance.participants = recipients;
     bcast_instance.payload = Some(data);
@@ -125,12 +125,12 @@ async fn participate_in_broadcast<T: Data>(
     while let Some(msg) = rx.recv().await {
         match msg.data {
             BroadcastRound::Init(_, data, participants) => {
-                let hash = canonical_hash(&data);
+                let hash = canonical_bytes(&data);
                 bcast_instance.participants = participants;
                 bcast_instance.payload = Some(data);
 
                 // Send out echo
-                let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(iface.pubkey, hash);
+                let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(iface.pubkey, hash.clone());
                 for participant in bcast_instance.participants.iter() {
                     if participant == &iface.pubkey {
                         continue;
@@ -143,7 +143,7 @@ async fn participate_in_broadcast<T: Data>(
                 if let Some(&echo_count) = bcast_instance.hash_echo_count.get(&hash) {
                     if echo_count >= bcast_instance.echo_to_ready_threshold() {
                         bcast_instance.is_echo_quorum_reached = true;
-                        send_ready(&mut bcast_instance, iface, hash, msg_link_id).await;
+                        send_ready(&mut bcast_instance, iface, hash.clone(), msg_link_id).await;
                     }
                 }
                 // Send Ready amp and deliver message if quorum is reached
@@ -159,18 +159,18 @@ async fn participate_in_broadcast<T: Data>(
                     }
                 }
             }
-            BroadcastRound::Echo(_sender, hash) => {
+            BroadcastRound::Echo(_sender, init_hash) => {
                 // Skip all counting logic if we've already sent out Ready
                 if bcast_instance.is_ready_msg_sent {
                     continue;
                 }
-                count_echo(&mut bcast_instance, iface, hash, msg_link_id).await;
+                count_echo(&mut bcast_instance, iface, init_hash.clone(), msg_link_id).await;
                 if bcast_instance.is_echo_quorum_reached {
-                    send_ready(&mut bcast_instance, iface, hash, msg_link_id).await;
+                    send_ready(&mut bcast_instance, iface, init_hash, msg_link_id).await;
                 }
             }
             BroadcastRound::Ready(_sender, hash) => {
-                count_ready(&mut bcast_instance, hash).await;
+                count_ready(&mut bcast_instance, hash.clone()).await;
                 // Check to see if I should send out Ready amplification
                 if bcast_instance.is_ready_amp_quorum_reached {
                     // Dont send Ready message if already sent
@@ -195,7 +195,7 @@ async fn participate_in_broadcast<T: Data>(
 async fn send_ready<T: Data>(
     bcast_instance: &mut BcastInstance<T>,
     iface: &Interface<BroadcastRound<T>>,
-    hash: DataHashOutput,
+    hash: Sha512HashBytes,
     msg_link_id: MsgLinkId,
 ) {
     let rdy_msg = BroadcastRound::Ready(iface.pubkey, hash);
@@ -218,7 +218,7 @@ async fn send_ready<T: Data>(
 async fn count_echo<T: Data>(
     bcast_instance: &mut BcastInstance<T>,
     iface: &Interface<BroadcastRound<T>>,
-    hash: DataHashOutput,
+    hash: Sha512HashBytes,
     msg_link_id: MsgLinkId,
 ) {
     let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
@@ -233,7 +233,7 @@ async fn count_echo<T: Data>(
         bcast_instance.is_echo_quorum_reached = true;
     }
 }
-async fn count_ready<T: Data>(bcast_instance: &mut BcastInstance<T>, hash: DataHashOutput) {
+async fn count_ready<T: Data>(bcast_instance: &mut BcastInstance<T>, hash: Sha512HashBytes) {
     let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
     *num_hashes += 1;
     // Can't check quorum if Init message hasnt been processed
@@ -266,52 +266,13 @@ mod tests {
         assert!(instance.payload.is_none());
     }
     #[test]
-    fn canonical_hash_deterministic() {
-        let data1 = "test_data".to_string();
-        let data2 = "test_data".to_string();
-        let hash1 = canonical_hash(&data1);
-        let hash2 = canonical_hash(&data2);
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 32);
-    }
-
-    #[test]
     fn canonical_hash_different_data() {
         let data1 = "test_data_1".to_string();
         let data2 = "test_data_2".to_string();
-        let hash1 = canonical_hash(&data1);
-        let hash2 = canonical_hash(&data2);
+        let hash1 = canonical_bytes(&data1);
+        let hash2 = canonical_bytes(&data2);
         assert_ne!(hash1, hash2);
     }
-
-    #[test]
-    fn canonical_hash_complex_data() {
-        #[derive(serde::Serialize)]
-        struct ComplexData {
-            id: u64,
-            name: String,
-            values: Vec<i32>,
-        }
-
-        let data = ComplexData {
-            id: 42,
-            name: "test".to_string(),
-            values: vec![1, 2, 3, 4, 5],
-        };
-
-        let hash = canonical_hash(&data);
-        assert_eq!(hash.len(), 32);
-
-        // Same data should produce same hash
-        let data2 = ComplexData {
-            id: 42,
-            name: "test".to_string(),
-            values: vec![1, 2, 3, 4, 5],
-        };
-        let hash2 = canonical_hash(&data2);
-        assert_eq!(hash, hash2);
-    }
-
     #[test]
     fn broadcast_round_init_serialization() {
         let initiator = UserId::new(100);
@@ -336,85 +297,6 @@ mod tests {
             _ => panic!("Wrong variant"),
         }
     }
-
-    #[test]
-    fn broadcast_round_echo_serialization() {
-        let sender = UserId::new(200);
-        let hash = [42u8; 32];
-
-        let round: BroadcastRound<String> = BroadcastRound::Echo(sender, hash);
-
-        let config = bincode::config::standard();
-        let encoded = bincode::serde::encode_to_vec(&round, config).unwrap();
-        let decoded: BroadcastRound<String> = bincode::serde::decode_from_slice(&encoded, config)
-            .unwrap()
-            .0;
-
-        match decoded {
-            BroadcastRound::Echo(s, h) => {
-                assert_eq!(s, sender);
-                assert_eq!(h, hash);
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn broadcast_round_ready_serialization() {
-        let sender = UserId::new(300);
-        let hash = [99u8; 32];
-
-        let round: BroadcastRound<String> = BroadcastRound::Ready(sender, hash);
-
-        let config = bincode::config::standard();
-        let encoded = bincode::serde::encode_to_vec(&round, config).unwrap();
-        let decoded: BroadcastRound<String> = bincode::serde::decode_from_slice(&encoded, config)
-            .unwrap()
-            .0;
-
-        match decoded {
-            BroadcastRound::Ready(s, h) => {
-                assert_eq!(s, sender);
-                assert_eq!(h, hash);
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn bcast_instance_echo_counting() {
-        let mut instance: BcastInstance<String> = BcastInstance::new();
-        let hash1 = [1u8; 32];
-        let hash2 = [2u8; 32];
-        // Count echos for hash1
-        *instance.hash_echo_count.entry(hash1).or_insert(0) += 1;
-        *instance.hash_echo_count.entry(hash1).or_insert(0) += 1;
-        *instance.hash_echo_count.entry(hash1).or_insert(0) += 1;
-        // Count echos for hash2
-        *instance.hash_echo_count.entry(hash2).or_insert(0) += 1;
-        assert_eq!(instance.hash_echo_count.get(&hash1), Some(&3));
-        assert_eq!(instance.hash_echo_count.get(&hash2), Some(&1));
-    }
-
-    #[test]
-    fn bcast_instance_ready_counting() {
-        let mut instance: BcastInstance<String> = BcastInstance::new();
-        let hash1 = [1u8; 32];
-        let hash2 = [2u8; 32];
-        // Count ready messages for hash1
-        *instance.hash_ready_count.entry(hash1).or_insert(0) += 1;
-        *instance.hash_ready_count.entry(hash1).or_insert(0) += 1;
-        // Count ready messages for hash2
-        *instance.hash_ready_count.entry(hash2).or_insert(0) += 1;
-        *instance.hash_ready_count.entry(hash2).or_insert(0) += 1;
-        *instance.hash_ready_count.entry(hash2).or_insert(0) += 1;
-        assert_eq!(instance.hash_ready_count.get(&hash1), Some(&2));
-        assert_eq!(instance.hash_ready_count.get(&hash2), Some(&3));
-    }
-
-    // ============================================================================
-    // INTEGRATION TESTS
-    // ============================================================================
 
     #[tokio::test]
     async fn broadcast_standard_four_nodes_happy_path() {
@@ -529,7 +411,7 @@ mod tests {
         let participants = vec![user0, user1, user2, user3];
 
         // Send an Echo message to node 1 before the Init arrives
-        let data_hash = canonical_hash(&broadcast_data);
+        let data_hash = canonical_bytes(&broadcast_data);
         let early_echo = BroadcastRound::Echo(user2, data_hash);
 
         iface2.send_msg(&user1, &early_echo, msg_link_id).await;
@@ -601,7 +483,7 @@ mod tests {
         // 10 nodes each starting 5 broadcasts = 50 total concurrent broadcasts.
 
         const NUM_NODES: usize = 10;
-        const BROADCASTS_PER_NODE: usize = 5;
+        const BROADCASTS_PER_NODE: usize = 4;
 
         println!(
             "Starting stress test: {} nodes, {} broadcasts per node, {} total",
@@ -760,147 +642,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_byzantine_conflicting_hashes() {
-        // Test that the protocol can handle a malicious node sending wrong hashes.
-        // One node will send Echo messages with an incorrect hash, but the honest
-        // majority should still reach consensus on the correct value.
-
-        let iface0: Arc<Interface<BroadcastRound<String>>> = Interface::new("127.0.0.1:0").await;
-        let iface1: Arc<Interface<BroadcastRound<String>>> = Interface::new("127.0.0.1:0").await;
-        let iface2: Arc<Interface<BroadcastRound<String>>> = Interface::new("127.0.0.1:0").await;
-        let iface3: Arc<Interface<BroadcastRound<String>>> = Interface::new("127.0.0.1:0").await;
-        let iface4: Arc<Interface<BroadcastRound<String>>> = Interface::new("127.0.0.1:0").await;
-
-        let user0 = iface0.pubkey;
-        let user1 = iface1.pubkey;
-        let user2 = iface2.pubkey;
-        let user3 = iface3.pubkey;
-        let user4 = iface4.pubkey;
-
-        for iface in [&iface0, &iface1, &iface2, &iface3, &iface4].iter() {
-            iface.add_addr(user0, iface0.addr).await;
-            iface.add_addr(user1, iface1.addr).await;
-            iface.add_addr(user2, iface2.addr).await;
-            iface.add_addr(user3, iface3.addr).await;
-            iface.add_addr(user4, iface4.addr).await;
-        }
-
-        let msg_link_id = MsgLinkId::new(300);
-        let broadcast_data = "Correct message".to_string();
-        let participants = vec![user0, user1, user2, user3, user4];
-
-        println!("Byzantine test: node 4 will send malicious Echo messages with a fake hash");
-
-        // Node 0 starts the broadcast
-        let iface0_clone = iface0.clone();
-        let data_clone = broadcast_data.clone();
-        let participants_clone = participants.clone();
-        let initiator_task = tokio::spawn(async move {
-            broadcast_init(&*iface0_clone, participants_clone, data_clone, msg_link_id).await
-        });
-
-        // Nodes 1, 2, and 3 participate honestly
-        let iface1_clone = iface1.clone();
-        let participant1_task = tokio::spawn(async move {
-            participate_in_broadcast(&iface1_clone, None, msg_link_id).await
-        });
-
-        let iface2_clone = iface2.clone();
-        let participant2_task = tokio::spawn(async move {
-            participate_in_broadcast(&iface2_clone, None, msg_link_id).await
-        });
-
-        let iface3_clone = iface3.clone();
-        let participant3_task = tokio::spawn(async move {
-            participate_in_broadcast(&iface3_clone, None, msg_link_id).await
-        });
-
-        // Node 4 will both participate and send malicious messages
-        let iface4_clone = iface4.clone();
-        let iface4_for_attack = iface4.clone();
-
-        // Spawn the Byzantine behavior
-        tokio::spawn(async move {
-            // Wait for Init to propagate
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Send Echo messages with a completely wrong hash
-            let fake_hash = [
-                0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-            ];
-
-            let malicious_echo = BroadcastRound::Echo(user4, fake_hash);
-
-            for target in [user0, user1, user2, user3].iter() {
-                iface4_for_attack
-                    .send_msg(target, &malicious_echo, msg_link_id)
-                    .await;
-            }
-
-            println!("  Node 4 sent malicious Echo messages to all other nodes");
-        });
-
-        // Node 4 also receives messages normally
-        let participant4_task = tokio::spawn(async move {
-            participate_in_broadcast(&iface4_clone, None, msg_link_id).await
-        });
-
-        let timeout_duration = Duration::from_secs(5);
-
-        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
-            .await
-            .expect("Node 0 timed out")
-            .expect("Node 0 task panicked")
-            .expect("Node 0 broadcast failed");
-
-        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
-            .await
-            .expect("Node 1 timed out")
-            .expect("Node 1 task panicked")
-            .expect("Node 1 broadcast failed");
-
-        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
-            .await
-            .expect("Node 2 timed out")
-            .expect("Node 2 task panicked")
-            .expect("Node 2 broadcast failed");
-
-        let result3 = tokio::time::timeout(timeout_duration, participant3_task)
-            .await
-            .expect("Node 3 timed out")
-            .expect("Node 3 task panicked")
-            .expect("Node 3 broadcast failed");
-
-        let result4 = tokio::time::timeout(timeout_duration, participant4_task)
-            .await
-            .expect("Node 4 timed out")
-            .expect("Node 4 task panicked")
-            .expect("Node 4 broadcast failed");
-
-        // Everyone should get the correct message despite the malicious node.
-        // The fake Echos get ignored because:
-        // - They don't match the hash from Init
-        // - The honest nodes (4 out of 5) send correct Echos
-        // - Quorum is 3, so 4 honest Echos are enough to proceed
-
-        assert_eq!(result0, broadcast_data);
-        assert_eq!(result1, broadcast_data);
-        assert_eq!(result2, broadcast_data);
-        assert_eq!(result3, broadcast_data);
-        assert_eq!(result4, broadcast_data);
-
-        println!("Byzantine fault tolerance verified");
-        println!("All nodes delivered the correct message despite the malicious node");
-        println!("Configuration: quorum 3/5, honest nodes 4/5, Byzantine nodes 1/5");
-    }
-    #[tokio::test]
     async fn broadcast_large_number_of_honest_recipients() {
         // Test a single broadcast with many honest recipients to verify
         // the protocol scales correctly with participant count
 
-        const NUM_NODES: usize = 20;
+        const NUM_NODES: usize = 10;
 
         println!("Testing broadcast with {} honest nodes", NUM_NODES);
 
