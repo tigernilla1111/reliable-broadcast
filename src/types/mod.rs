@@ -1,7 +1,9 @@
-use std::ops::Deref;
-
 use rand::Rng;
+use std::ops::Deref;
 type PubId = u64;
+
+pub type DataHashOutput = [u8; 32];
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct UserId(PubId);
 impl UserId {

@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::u8;
 
-use bincode::serde::encode_to_vec;
-use sha2::{Digest, Sha256};
-
+use crate::crypto::{DataHashOutput, canonical_hash};
 use crate::network::{Data, Interface, MsgLink, MsgLinkId};
 use crate::types::{Signature, UserId};
 // Brachas Broadcast Implementation
@@ -31,9 +29,6 @@ use crate::types::{Signature, UserId};
 // alpha = qourum on Echo messages needed to send Ready
 // alpha = ((n+t)/2) + 1 = ((n+(n-1)/3)) +1 = ((n + (n/3) + (1/3)))+1= ((4n/3 ))
 
-const MAX_ENCODING_BYTES: usize = 10000;
-type DataHashOutput = [u8; 32];
-
 struct BcastInstance<T> {
     /// How many Echo received for a specific hash
     hash_echo_count: HashMap<DataHashOutput, usize>,
@@ -49,7 +44,6 @@ struct BcastInstance<T> {
     /// includes the initiator
     participants: Vec<UserId>,
     payload: Option<T>,
-    // TODO: track echo and ready msgs received from a sender in a hashset (one for echos, one for readys)
 }
 impl<T> BcastInstance<T> {
     fn new() -> Self {
@@ -128,11 +122,9 @@ async fn participate_in_broadcast<T: Data>(
     let mut rx = iface.registry.subscribe(msg_link_id).await.unwrap();
     let mut bcast_instance = bcast_instance.unwrap_or(BcastInstance::new());
     // TODO: validate signature
-    // TODO: do all message handling in this loop
     while let Some(msg) = rx.recv().await {
         match msg.data {
             BroadcastRound::Init(_, data, participants) => {
-                // TODO: check for multiple init messages
                 let hash = canonical_hash(&data);
                 bcast_instance.participants = participants;
                 bcast_instance.payload = Some(data);
@@ -257,17 +249,6 @@ async fn count_ready<T: Data>(bcast_instance: &mut BcastInstance<T>, hash: DataH
     if count >= bcast_instance.delivery_threshold() {
         bcast_instance.is_delivery_threshold_reached = true;
     }
-}
-
-fn canonical_hash<T: serde::Serialize>(value: &T) -> DataHashOutput {
-    let config = bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding()
-        .with_limit::<MAX_ENCODING_BYTES>();
-    let bytes = encode_to_vec(value, config).expect("serialization failed");
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    hasher.finalize().into()
 }
 
 mod tests {

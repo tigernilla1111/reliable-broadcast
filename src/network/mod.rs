@@ -50,9 +50,6 @@ mod api {
 }
 
 /// Allows to have an arbitrary amount of Types of messages.
-/// Can reserve a MsgLinkId eg 0 and have gossip comms come over that
-/// TODO maybe: add a reserve system to designate certain LinkIds to an enum the user can define.
-///.      Randomly generated LinkIds cannot be one of the reserves
 type InnerRegistry<T> = HashMap<MsgLinkId, (Sender<MsgLink<T>>, Option<Receiver<MsgLink<T>>>)>;
 #[derive(Clone)]
 pub struct Registry<T> {
