@@ -5,29 +5,6 @@ use std::u8;
 use crate::crypto::{Sha512HashBytes, Sha512HashOutput, canonical_bytes};
 use crate::network::{Data, Interface, MsgLink, MsgLinkId};
 use crate::types::{Signature, UserId};
-// Brachas Broadcast Implementation
-// operation brb broadcast(m) is % Code for pi
-// (1) broadcast INIT(i, m).
-// when a message INIT(j, −) is received from pj do
-// (2) if first reception of INIT(j, m) then broadcast ECHO(j, m).
-// when a message ECHO(j, m) is received from any process do
-// (3) if ECHO(j, m) received from α different processes ∧ READY(j, m) not yet broadcast
-// (4) then broadcast READY(j, m)
-// (5) end if.
-// when a message READY(j, m) is received from any process do
-// (6) if READY(j, , m) received from β different processes ∧ READY(j, m) not yet broadcast
-// (7) then broadcast READY(j, m)
-// (8) end if;
-// (9) if READY(j, m) received from γ different processes ∧ (no pair
-// (j, −) already brb-delivered)
-// (10) then brb delivery of (j, m)
-// (11) end if.
-
-// n > 3t
-// n = 3t + 1
-// t = (n-1)/3
-// alpha = qourum on Echo messages needed to send Ready
-// alpha = ((n+t)/2) + 1 = ((n+(n-1)/3)) +1 = ((n + (n/3) + (1/3)))+1= ((4n/3 ))
 
 struct BcastInstance<T> {
     /// How many Echo received for a specific hash
