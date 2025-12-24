@@ -8,6 +8,7 @@ use crate::network::MsgLinkId;
 const MAX_ENCODING_BYTES: usize = 10000;
 
 pub type Sha512HashBytes = Vec<u8>;
+
 #[derive(serde::Deserialize, serde::Serialize, PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub struct PublicKeyBytes([u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
 
@@ -47,11 +48,11 @@ impl PrivateKey {
     pub fn get_sig_and_hash<T: serde::Serialize>(
         &self,
         data: &T,
-        intiator: PublicKeyBytes,
+        initiator: PublicKeyBytes,
         participants: &Vec<PublicKeyBytes>,
         msg_link_id: MsgLinkId,
     ) -> (Signature, Sha512HashBytes) {
-        let hasher = sha512_init_msg_hasher(&data, intiator, participants, msg_link_id);
+        let hasher = sha512_init_msg_hasher(&data, initiator, participants, msg_link_id);
         let signature = Signature(self.0.sign_prehashed(hasher.clone(), None).unwrap());
         (signature, hasher.finalize().to_vec())
     }
@@ -72,13 +73,13 @@ pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// So manually create the a Sha512 hash which can be fed into the sign_prehashed
 fn sha512_init_msg_hasher<D: serde::Serialize>(
     data: &D,
-    intiator: PublicKeyBytes,
+    initiator: PublicKeyBytes,
     participants: &Vec<PublicKeyBytes>,
     msg_link_id: MsgLinkId,
 ) -> Sha512 {
     let mut hasher = Sha512::new();
     hasher.update(canonical_bytes(&data));
-    hasher.update(intiator.0);
+    hasher.update(initiator.0);
     for participant in participants {
         hasher.update(participant.0);
     }
@@ -88,11 +89,11 @@ fn sha512_init_msg_hasher<D: serde::Serialize>(
 
 pub fn init_msg_hash<D: serde::Serialize>(
     data: &D,
-    intiator: PublicKeyBytes,
+    initiator: PublicKeyBytes,
     participants: &Vec<PublicKeyBytes>,
     msg_link_id: MsgLinkId,
 ) -> Sha512HashBytes {
-    sha512_init_msg_hasher(data, intiator, participants, msg_link_id)
+    sha512_init_msg_hasher(data, initiator, participants, msg_link_id)
         .finalize()
         .to_vec()
 }
