@@ -20,5 +20,3 @@ impl Deref for UserId {
         &self.0
     }
 }
-
-pub type Signature = String;
