@@ -5,7 +5,6 @@ use crate::crypto::{PrivateKey, PublicKeyBytes, Sha512HashBytes, Signature, cano
 use crate::network::{Data, Interface, MsgLink, MsgLinkId, Registry};
 
 /// Protocol-aware wrapper around Interface that handles signing and identity
-#[derive(Clone)]
 pub struct ProtocolNode<T> {
     interface: Arc<Interface<BroadcastRound<T>>>,
     private_key: Arc<PrivateKey>,
@@ -40,7 +39,7 @@ impl<T: Data> ProtocolNode<T> {
         self.interface.add_addr(pubkey, addr).await;
     }
 
-    pub fn get_sig_and_hash<S: serde::Serialize>(
+    fn get_sig_and_hash<S: serde::Serialize>(
         &self,
         data: &S,
         initiator: PublicKeyBytes,
@@ -51,7 +50,7 @@ impl<T: Data> ProtocolNode<T> {
             .get_sig_and_hash(data, initiator, participants, msg_link_id)
     }
 
-    pub async fn send_msg(
+    async fn send_msg(
         &self,
         rcvr: &PublicKeyBytes,
         msg: &BroadcastRound<T>,
@@ -60,6 +59,195 @@ impl<T: Data> ProtocolNode<T> {
         self.interface
             .send_msg(rcvr, msg, msg_link_id, self.public_key)
             .await;
+    }
+
+    /// Start a reliable broadcast and participate in it
+    pub async fn broadcast_init(
+        &self,
+        recipients: Vec<PublicKeyBytes>,
+        data: T,
+        msg_link_id: MsgLinkId,
+    ) -> Result<T, String> {
+        let msg = BroadcastRound::Init(*self.public_key(), data.clone(), recipients.clone());
+        let (_sig, hash) =
+            self.get_sig_and_hash(&data, *self.public_key(), &recipients, msg_link_id);
+
+        for rcvr in recipients.iter() {
+            self.send_msg(rcvr, &msg, msg_link_id).await;
+        }
+
+        // need to set up init state here because initiator wont receive init RPC (from himself)
+        let mut bcast_instance = BcastInstance::new();
+        bcast_instance.participants = recipients;
+        bcast_instance.payload = Some(data);
+
+        // Send out echo
+        let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(*self.public_key(), hash);
+        for participant in bcast_instance.participants.iter() {
+            if participant == self.public_key() {
+                continue;
+            }
+            self.send_msg(participant, &echo_msg, msg_link_id).await;
+        }
+
+        self.participate_in_broadcast(Some(bcast_instance), msg_link_id)
+            .await
+    }
+
+    /// Participate as a recipient of a reliable broadcast
+    pub async fn participate_in_broadcast(
+        &self,
+        bcast_instance: Option<BcastInstance<T>>,
+        msg_link_id: MsgLinkId,
+    ) -> Result<T, String> {
+        let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
+        let mut bcast_instance = bcast_instance.unwrap_or(BcastInstance::new());
+
+        // TODO: validate signature
+        while let Some(msg) = rx.recv().await {
+            match msg.data {
+                BroadcastRound::Init(_, data, participants) => {
+                    let hash = canonical_bytes(&data);
+                    bcast_instance.participants = participants;
+                    bcast_instance.payload = Some(data);
+
+                    // Send out echo
+                    let echo_msg: BroadcastRound<T> =
+                        BroadcastRound::Echo(*self.public_key(), hash.clone());
+                    for participant in bcast_instance.participants.iter() {
+                        if participant == self.public_key() {
+                            continue;
+                        }
+                        self.send_msg(participant, &echo_msg, msg_link_id).await;
+                    }
+
+                    // check for quorums reached on messages received before processing Init
+                    // send out Ready if quorum is reached
+                    if let Some(&echo_count) = bcast_instance.hash_echo_count.get(&hash) {
+                        if echo_count >= bcast_instance.echo_to_ready_threshold() {
+                            bcast_instance.echo_threshold_reached = true;
+                            self.send_ready(&mut bcast_instance, hash.clone(), msg_link_id)
+                                .await;
+                        }
+                    }
+
+                    // Send Ready amp and deliver message if quorum is reached
+                    if let Some(&ready_count) = bcast_instance.hash_ready_count.get(&hash) {
+                        if ready_count >= bcast_instance.ready_amp_threshold() {
+                            self.send_ready(&mut bcast_instance, hash, msg_link_id)
+                                .await;
+                        }
+
+                        if ready_count >= bcast_instance.delivery_threshold() {
+                            return bcast_instance
+                                .payload
+                                .ok_or("No payload initiated".to_string());
+                        }
+                    }
+                }
+                BroadcastRound::Echo(_sender, init_hash) => {
+                    // Skip all counting logic if we've already sent out Ready
+                    if bcast_instance.is_ready_msg_sent {
+                        continue;
+                    }
+                    self.count_echo(&mut bcast_instance, init_hash.clone(), msg_link_id)
+                        .await;
+                    if bcast_instance.echo_threshold_reached {
+                        self.send_ready(&mut bcast_instance, init_hash, msg_link_id)
+                            .await;
+                    }
+                }
+                BroadcastRound::Ready(_sender, hash) => {
+                    Self::count_ready(&mut bcast_instance, hash.clone()).await;
+                    // Check to see if I should send out Ready amplification
+                    if bcast_instance.ready_amp_threshold_reached {
+                        // Dont send Ready message if already sent
+                        if !bcast_instance.is_ready_msg_sent {
+                            self.send_ready(&mut bcast_instance, hash, msg_link_id)
+                                .await;
+                        }
+                    }
+                    if bcast_instance.delivery_threshold_reached {
+                        drop(rx);
+                        return bcast_instance
+                            .payload
+                            .ok_or("Payload not initialized".to_string());
+                    }
+                }
+            }
+        }
+
+        drop(rx);
+        Err("no".to_string())
+    }
+
+    async fn send_ready(
+        &self,
+        bcast_instance: &mut BcastInstance<T>,
+        hash: Sha512HashBytes,
+        msg_link_id: MsgLinkId,
+    ) {
+        let rdy_msg = BroadcastRound::Ready(*self.public_key(), hash);
+        let participants = bcast_instance.participants.clone();
+        let public_key = *self.public_key();
+        let interface = self.interface.clone();
+
+        tokio::task::spawn(async move {
+            for participant in participants {
+                if participant == public_key {
+                    continue;
+                }
+                let rdy_msg_clone = rdy_msg.clone();
+                interface
+                    .send_msg(&participant, &rdy_msg_clone, msg_link_id, public_key)
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+
+        bcast_instance.is_ready_msg_sent = true;
+    }
+
+    async fn count_echo(
+        &self,
+        bcast_instance: &mut BcastInstance<T>,
+        hash: Sha512HashBytes,
+        _msg_link_id: MsgLinkId,
+    ) {
+        let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
+        *num_hashes += 1;
+
+        // Can't check quorum if Init message hasnt been processed
+        if bcast_instance.payload.is_none() {
+            return;
+        }
+
+        // Send Ready out and mark flag to not send multiple Ready(s) out
+        if *num_hashes >= bcast_instance.echo_to_ready_threshold() {
+            bcast_instance.echo_threshold_reached = true;
+        }
+    }
+
+    async fn count_ready(bcast_instance: &mut BcastInstance<T>, hash: Sha512HashBytes) {
+        let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
+        *num_hashes += 1;
+
+        // Can't check quorum if Init message hasnt been processed
+        if bcast_instance.payload.is_none() {
+            return;
+        }
+
+        let count = *num_hashes;
+
+        // Have I reached threshold of Readys to send my own Ready
+        if count >= bcast_instance.ready_amp_threshold() {
+            bcast_instance.ready_amp_threshold_reached = true;
+        }
+
+        // Check to
+        if count >= bcast_instance.delivery_threshold() {
+            bcast_instance.delivery_threshold_reached = true;
+        }
     }
 }
 
@@ -78,6 +266,7 @@ struct BcastInstance<T> {
     participants: Vec<PublicKeyBytes>,
     payload: Option<T>,
 }
+
 impl<T> BcastInstance<T> {
     fn new() -> Self {
         Self {
@@ -96,15 +285,18 @@ impl<T> BcastInstance<T> {
         let n = self.participants.len();
         (n + ((n - 1) / 3) + 1).div_ceil(2)
     }
+
     fn ready_amp_threshold(&self) -> usize {
         let n = self.participants.len();
         ((n - 1) / 3) + 1
     }
+
     fn delivery_threshold(&self) -> usize {
         let n = self.participants.len();
         (((n - 1) / 3) * 2) + 1
     }
 }
+
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub enum BroadcastRound<T> {
     /// (Initiator, Data, Participants)
@@ -113,189 +305,4 @@ pub enum BroadcastRound<T> {
     Echo(PublicKeyBytes, Sha512HashBytes),
     /// Sender, Hash
     Ready(PublicKeyBytes, Sha512HashBytes),
-}
-/// Start a reliable broadcast and participate in it
-pub async fn broadcast_init<T: Data>(
-    node: &ProtocolNode<T>,
-    recipients: Vec<PublicKeyBytes>,
-    data: T,
-    msg_link_id: MsgLinkId,
-) -> Result<T, String> {
-    let msg = BroadcastRound::Init(*node.public_key(), data.clone(), recipients.clone());
-    let (_sig, hash) = node.get_sig_and_hash(&data, *node.public_key(), &recipients, msg_link_id);
-
-    for rcvr in recipients.iter() {
-        node.send_msg(
-            rcvr,
-            &msg,
-            msg_link_id, //TODO: signature
-        )
-        .await;
-    }
-
-    // need to set up init state here because initiator wont receive init RPC (from himself)
-    let mut bcast_instance = BcastInstance::new();
-    bcast_instance.participants = recipients;
-    bcast_instance.payload = Some(data);
-
-    // Send out echo
-    let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(*node.public_key(), hash);
-    for participant in bcast_instance.participants.iter() {
-        if participant == node.public_key() {
-            continue;
-        }
-        node.send_msg(participant, &echo_msg, msg_link_id).await;
-    }
-
-    participate_in_broadcast(&node, Some(bcast_instance), msg_link_id).await
-}
-
-/// function to run to participate as a recipient of a reliable broadcast
-pub async fn participate_in_broadcast<T: Data>(
-    node: &ProtocolNode<T>,
-    bcast_instance: Option<BcastInstance<T>>,
-    msg_link_id: MsgLinkId,
-) -> Result<T, String> {
-    let mut rx = node.registry().subscribe(msg_link_id).await.unwrap();
-    let mut bcast_instance = bcast_instance.unwrap_or(BcastInstance::new());
-
-    // TODO: validate signature
-    while let Some(msg) = rx.recv().await {
-        match msg.data {
-            BroadcastRound::Init(_, data, participants) => {
-                let hash = canonical_bytes(&data);
-                bcast_instance.participants = participants;
-                bcast_instance.payload = Some(data);
-
-                // Send out echo
-                let echo_msg: BroadcastRound<T> =
-                    BroadcastRound::Echo(*node.public_key(), hash.clone());
-                for participant in bcast_instance.participants.iter() {
-                    if participant == node.public_key() {
-                        continue;
-                    }
-                    node.send_msg(participant, &echo_msg, msg_link_id).await;
-                }
-
-                // check for quorums reached on messages received before processing Init
-                // send out Ready if quorum is reached
-                if let Some(&echo_count) = bcast_instance.hash_echo_count.get(&hash) {
-                    if echo_count >= bcast_instance.echo_to_ready_threshold() {
-                        bcast_instance.echo_threshold_reached = true;
-                        send_ready(&mut bcast_instance, node, hash.clone(), msg_link_id).await;
-                    }
-                }
-
-                // Send Ready amp and deliver message if quorum is reached
-                if let Some(&ready_count) = bcast_instance.hash_ready_count.get(&hash) {
-                    if ready_count >= bcast_instance.ready_amp_threshold() {
-                        send_ready(&mut bcast_instance, node, hash, msg_link_id).await;
-                    }
-
-                    if ready_count >= bcast_instance.delivery_threshold() {
-                        return bcast_instance
-                            .payload
-                            .ok_or("No payload initiated".to_string());
-                    }
-                }
-            }
-            BroadcastRound::Echo(_sender, init_hash) => {
-                // Skip all counting logic if we've already sent out Ready
-                if bcast_instance.is_ready_msg_sent {
-                    continue;
-                }
-                count_echo(&mut bcast_instance, node, init_hash.clone(), msg_link_id).await;
-                if bcast_instance.echo_threshold_reached {
-                    send_ready(&mut bcast_instance, node, init_hash, msg_link_id).await;
-                }
-            }
-            BroadcastRound::Ready(_sender, hash) => {
-                count_ready(&mut bcast_instance, hash.clone()).await;
-                // Check to see if I should send out Ready amplification
-                if bcast_instance.ready_amp_threshold_reached {
-                    // Dont send Ready message if already sent
-                    if !bcast_instance.is_ready_msg_sent {
-                        send_ready(&mut bcast_instance, node, hash, msg_link_id).await;
-                    }
-                }
-                if bcast_instance.delivery_threshold_reached {
-                    drop(rx);
-                    return bcast_instance
-                        .payload
-                        .ok_or("Payload not initialized".to_string());
-                }
-            }
-        }
-    }
-
-    drop(rx);
-    Err("no".to_string())
-}
-
-async fn send_ready<T: Data>(
-    bcast_instance: &mut BcastInstance<T>,
-    node: &ProtocolNode<T>,
-    hash: Sha512HashBytes,
-    msg_link_id: MsgLinkId,
-) {
-    let rdy_msg = BroadcastRound::Ready(*node.public_key(), hash);
-    let participants = bcast_instance.participants.clone();
-    let node_clone = Arc::new(node.clone());
-
-    tokio::task::spawn(async move {
-        for participant in participants {
-            if participant == *node_clone.public_key() {
-                continue;
-            }
-            let rdy_msg_clone = rdy_msg.clone();
-            node_clone
-                .send_msg(&participant, &rdy_msg_clone, msg_link_id)
-                .await;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    });
-
-    bcast_instance.is_ready_msg_sent = true;
-}
-
-async fn count_echo<T: Data>(
-    bcast_instance: &mut BcastInstance<T>,
-    _node: &ProtocolNode<T>,
-    hash: Sha512HashBytes,
-    _msg_link_id: MsgLinkId,
-) {
-    let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
-    *num_hashes += 1;
-
-    // Can't check quorum if Init message hasnt been processed
-    if bcast_instance.payload.is_none() {
-        return;
-    }
-
-    // Send Ready out and mark flag to not send multiple Ready(s) out
-    if *num_hashes >= bcast_instance.echo_to_ready_threshold() {
-        bcast_instance.echo_threshold_reached = true;
-    }
-}
-
-async fn count_ready<T: Data>(bcast_instance: &mut BcastInstance<T>, hash: Sha512HashBytes) {
-    let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
-    *num_hashes += 1;
-
-    // Can't check quorum if Init message hasnt been processed
-    if bcast_instance.payload.is_none() {
-        return;
-    }
-
-    let count = *num_hashes;
-
-    // Have I reached threshold of Readys to send my own Ready
-    if count >= bcast_instance.ready_amp_threshold() {
-        bcast_instance.ready_amp_threshold_reached = true;
-    }
-
-    // Check to
-    if count >= bcast_instance.delivery_threshold() {
-        bcast_instance.delivery_threshold_reached = true;
-    }
 }
