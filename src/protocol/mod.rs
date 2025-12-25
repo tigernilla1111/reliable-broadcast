@@ -1,11 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::crypto::{
-    HashBytes, PrivateKey, PublicKeyBytes, SignatureBytes, canonical_bytes, verify_echo,
-    verify_init, verify_ready,
+    HashBytes, PrivateKey, PublicKeyBytes, SignatureBytes, verify_echo, verify_init, verify_ready,
 };
-use crate::network::{Data, Interface, MsgLink, MsgLinkId, Registry};
+use crate::network::{Data, Interface, MsgLinkId, Registry};
 
 /// Protocol-aware wrapper around Interface that handles signing and identity
 pub struct ProtocolNode<T> {
@@ -103,6 +102,7 @@ impl<T: Data> ProtocolNode<T> {
     }
 
     pub async fn participate_in_broadcast(&self, msg_link_id: MsgLinkId) -> Result<T, String> {
+        // TODO: wait for round one message here and then go into participate_inner() with participants set
         self.participate_in_broadcast_inner(BcastInstance::new(), msg_link_id)
             .await
     }
@@ -114,14 +114,22 @@ impl<T: Data> ProtocolNode<T> {
     ) -> Result<T, String> {
         let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
         let mut bcast_instance = bcast_instance;
-
         while let Some(msg) = rx.recv().await {
-            match msg.data {
-                BroadcastRound::Init(initiator, data, participants, init_sig) => {
-                    // validate Initiator signature
-                    let hash = verify_init(&init_sig, &data, initiator, &participants, msg_link_id)
-                        .expect("Invalid signature");
+            let sender = msg.sender;
 
+            match msg.data {
+                BroadcastRound::Init(sender, data, participants, init_sig) => {
+                    if bcast_instance.payload.is_some() {
+                        eprintln!("multiple init message for the same msg id");
+                        continue;
+                    }
+                    // validate Initiator signature
+                    let Ok(hash) =
+                        verify_init(&init_sig, &data, sender, &participants, msg_link_id)
+                    else {
+                        eprintln!("invalid signature");
+                        continue;
+                    };
                     bcast_instance.participants = participants;
                     bcast_instance.payload = Some(data);
 
@@ -161,25 +169,38 @@ impl<T: Data> ProtocolNode<T> {
                     }
                 }
                 BroadcastRound::Echo(sender, init_hash, sender_sig) => {
-                    // Validate sender signature
-                    if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
-                        continue;
-                    }
                     // Skip all counting logic if we've already sent out Ready
                     if bcast_instance.is_ready_msg_sent {
                         continue;
                     }
-                    Self::count_echo(&mut bcast_instance, init_hash.clone(), msg_link_id).await;
+                    if bcast_instance.has_sent_echo(sender) {
+                        eprintln!("Multiple echo messages from {sender:?}");
+                        continue;
+                    }
+                    // Validate sender signature
+                    if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
+                        continue;
+                    }
+                    // TODO: check if we have participants.  If we do, `continue` (ie skip) if sender is not in
+                    //participant list.  If we dont, all messages should be stored temporarily with the sender
+                    // and only counted when we get the participants from init
+                    // Ignore echo message if we've received an echo message from that pubkey
+                    Self::count_echo(&mut bcast_instance, init_hash.clone(), sender).await;
                     if bcast_instance.echo_threshold_reached {
                         self.send_ready(&mut bcast_instance, init_hash, msg_link_id)
                             .await;
                     }
                 }
                 BroadcastRound::Ready(sender, init_hash, signature) => {
-                    if verify_ready(sender, init_hash, msg_link_id, signature).is_err() {
+                    if bcast_instance.has_sent_ready(sender) {
+                        eprintln!("Multiple ready messages from {sender:?}");
                         continue;
                     }
-                    Self::count_ready(&mut bcast_instance, init_hash.clone()).await;
+                    if verify_ready(sender, init_hash, msg_link_id, signature).is_err() {
+                        eprintln!("Invalid signature from {sender:?}");
+                        continue;
+                    }
+                    Self::count_ready(&mut bcast_instance, init_hash.clone(), sender).await;
                     // Check to see if I should send out Ready amplification
                     if bcast_instance.ready_amp_threshold_reached {
                         // Dont send Ready message if already sent
@@ -233,39 +254,44 @@ impl<T: Data> ProtocolNode<T> {
     async fn count_echo(
         bcast_instance: &mut BcastInstance<T>,
         hash: HashBytes,
-        _msg_link_id: MsgLinkId,
+        sender: PublicKeyBytes,
     ) {
         let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
         *num_hashes += 1;
-
+        let count = *num_hashes;
+        bcast_instance.sent_echo(sender);
         // Can't check quorum if Init message hasnt been processed
         if bcast_instance.payload.is_none() {
             return;
         }
 
         // Send Ready out and mark flag to not send multiple Ready(s) out
-        if *num_hashes >= bcast_instance.echo_to_ready_threshold() {
+        if count >= bcast_instance.echo_to_ready_threshold() {
             bcast_instance.echo_threshold_reached = true;
         }
     }
 
-    async fn count_ready(bcast_instance: &mut BcastInstance<T>, hash: HashBytes) {
+    async fn count_ready(
+        bcast_instance: &mut BcastInstance<T>,
+        hash: HashBytes,
+        sender: PublicKeyBytes,
+    ) {
         let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
         *num_hashes += 1;
+        let count = *num_hashes;
+        bcast_instance.sent_ready(sender);
 
         // Can't check quorum if Init message hasnt been processed
         if bcast_instance.payload.is_none() {
             return;
         }
 
-        let count = *num_hashes;
-
         // Have I reached threshold of Readys to send my own Ready
         if count >= bcast_instance.ready_amp_threshold() {
             bcast_instance.ready_amp_threshold_reached = true;
         }
 
-        // Check to
+        // Check for delivery threshold
         if count >= bcast_instance.delivery_threshold() {
             bcast_instance.delivery_threshold_reached = true;
         }
@@ -277,6 +303,8 @@ struct BcastInstance<T> {
     hash_echo_count: HashMap<HashBytes, usize>,
     /// How may Ready messages received for a specific hash
     hash_ready_count: HashMap<HashBytes, usize>,
+    /// Has identity sent Echos or Readys for this `MsgLinkId`
+    senders: HashMap<PublicKeyBytes, (bool, bool)>,
     is_ready_msg_sent: bool,
     echo_threshold_reached: bool,
     // have I received enough Readys to send out my own Ready to all of the protocol (Ready amplification)
@@ -293,6 +321,7 @@ impl<T> BcastInstance<T> {
         Self {
             hash_echo_count: HashMap::new(),
             hash_ready_count: HashMap::new(),
+            senders: HashMap::new(),
             is_ready_msg_sent: false,
             echo_threshold_reached: false,
             ready_amp_threshold_reached: false,
@@ -301,7 +330,20 @@ impl<T> BcastInstance<T> {
             payload: None,
         }
     }
-
+    fn has_sent_echo(&self, pubkey: PublicKeyBytes) -> bool {
+        self.senders.get(&pubkey).unwrap_or(&(false, false)).0
+    }
+    fn has_sent_ready(&self, pubkey: PublicKeyBytes) -> bool {
+        self.senders.get(&pubkey).unwrap_or(&(false, false)).1
+    }
+    fn sent_echo(&mut self, pubkey: PublicKeyBytes) {
+        let (has_sent_echo, _) = self.senders.entry(pubkey).or_insert((false, false));
+        *has_sent_echo = true;
+    }
+    fn sent_ready(&mut self, pubkey: PublicKeyBytes) {
+        let (_, has_sent_ready) = self.senders.entry(pubkey).or_insert((false, false));
+        *has_sent_ready = true;
+    }
     fn echo_to_ready_threshold(&self) -> usize {
         let n = self.participants.len();
         (n + ((n - 1) / 3) + 1).div_ceil(2)
@@ -321,6 +363,7 @@ impl<T> BcastInstance<T> {
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub enum BroadcastRound<T> {
     /// (Initiator, Data, Participants, InitiatorSignature)
+    /// TODO: remove this
     Init(PublicKeyBytes, T, Vec<PublicKeyBytes>, SignatureBytes),
     /// Sender, Hash
     Echo(PublicKeyBytes, HashBytes, SignatureBytes),

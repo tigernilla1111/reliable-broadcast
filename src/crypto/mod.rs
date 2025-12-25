@@ -4,12 +4,22 @@ use ed25519_dalek::Verifier;
 use ed25519_dalek::ed25519::signature::Signer;
 use rand_core::OsRng;
 use serde_bytes;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha512, digest::OutputSizeUser};
+use thiserror;
 
 const MAX_ENCODING_BYTES: usize = 10000;
+const SHA512_OUTPUT_BYTES: usize = 64;
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("invalid signature from {0:?}")]
+    InvalidSignature(PublicKeyBytes),
+
+    #[error("unconstructable public key {0:?}")]
+    InvalidPublicKey(PublicKeyBytes),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash)]
-pub struct HashBytes(#[serde(with = "serde_bytes")] [u8; 64]);
+pub struct HashBytes(#[serde(with = "serde_bytes")] [u8; SHA512_OUTPUT_BYTES]);
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct SignatureBytes(#[serde(with = "serde_bytes")] [u8; ed25519_dalek::SIGNATURE_LENGTH]);
@@ -33,7 +43,7 @@ pub fn verify_init<T: serde::Serialize>(
     participants: &Vec<PublicKeyBytes>,
     msg_link_id: MsgLinkId,
 ) -> Result<HashBytes, ()> {
-    let hasher = sha512_init_msg_hasher(&data, initiator_bytes, participants, msg_link_id);
+    let hasher = init_msg_hasher(&data, initiator_bytes, participants, msg_link_id);
     let sig = sig.to_signature();
     let pubkey = initiator_bytes.to_verifying_key();
     pubkey
@@ -86,7 +96,7 @@ impl PrivateKey {
         participants: &Vec<PublicKeyBytes>,
         msg_link_id: MsgLinkId,
     ) -> (SignatureBytes, HashBytes) {
-        let hasher = sha512_init_msg_hasher(&data, initiator, participants, msg_link_id);
+        let hasher = init_msg_hasher(&data, initiator, participants, msg_link_id);
         let signature = SignatureBytes(
             self.0
                 .sign_prehashed(hasher.clone(), None)
@@ -131,7 +141,7 @@ fn canonical_ready_bytes(
 }
 /// Data types that contain a HashMap or HashSet cannot be used in this function
 /// They must be converted into an ordered set eg Vec or BTreeSet
-pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
+fn canonical_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding()
@@ -142,7 +152,7 @@ pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// Can't use the ed25519_dalek::SigningKey.sign on the init message because we need to expose the
 /// hash it produces to be signed, which can't be done with that crate.
 /// So manually create the a Sha512 hash which can be fed into the sign_prehashed
-fn sha512_init_msg_hasher<D: serde::Serialize>(
+fn init_msg_hasher<D: serde::Serialize>(
     data: &D,
     initiator: PublicKeyBytes,
     participants: &Vec<PublicKeyBytes>,
@@ -165,7 +175,7 @@ pub fn init_msg_hash<D: serde::Serialize>(
     msg_link_id: MsgLinkId,
 ) -> HashBytes {
     HashBytes(
-        sha512_init_msg_hasher(data, initiator, participants, msg_link_id)
+        init_msg_hasher(data, initiator, participants, msg_link_id)
             .finalize()
             .into(),
     )
