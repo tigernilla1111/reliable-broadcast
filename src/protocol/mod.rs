@@ -1,24 +1,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::crypto::{PrivateKey, PublicKeyBytes, Sha512HashBytes, Signature, canonical_bytes};
+use crate::crypto::{
+    HashBytes, PrivateKey, PublicKeyBytes, SignatureBytes, canonical_bytes, verify_echo,
+    verify_init, verify_ready,
+};
 use crate::network::{Data, Interface, MsgLink, MsgLinkId, Registry};
 
 /// Protocol-aware wrapper around Interface that handles signing and identity
 pub struct ProtocolNode<T> {
     interface: Arc<Interface<BroadcastRound<T>>>,
-    private_key: Arc<PrivateKey>,
+    private_key: PrivateKey,
     public_key: PublicKeyBytes,
 }
 
 impl<T: Data> ProtocolNode<T> {
     pub async fn new(addr: impl tokio::net::ToSocketAddrs, private_key: PrivateKey) -> Arc<Self> {
-        let public_key = private_key.to_public_key().to_bytes();
+        let public_key = private_key.to_public_key();
         let interface = Interface::new(addr).await;
 
         Arc::new(Self {
             interface,
-            private_key: Arc::new(private_key),
+            private_key: private_key,
             public_key,
         })
     }
@@ -35,7 +38,11 @@ impl<T: Data> ProtocolNode<T> {
         self.interface.addr
     }
 
-    pub async fn add_addr(&self, pubkey: crate::crypto::PublicKey, addr: std::net::SocketAddr) {
+    pub async fn add_addr(
+        &self,
+        pubkey: crate::crypto::PublicKeyBytes,
+        addr: std::net::SocketAddr,
+    ) {
         self.interface.add_addr(pubkey, addr).await;
     }
 
@@ -45,9 +52,9 @@ impl<T: Data> ProtocolNode<T> {
         initiator: PublicKeyBytes,
         participants: &Vec<PublicKeyBytes>,
         msg_link_id: MsgLinkId,
-    ) -> (Signature, Sha512HashBytes) {
+    ) -> (SignatureBytes, HashBytes) {
         self.private_key
-            .get_sig_and_hash(data, initiator, participants, msg_link_id)
+            .sig_and_hash(data, initiator, participants, msg_link_id)
     }
 
     async fn send_msg(
@@ -68,9 +75,9 @@ impl<T: Data> ProtocolNode<T> {
         data: T,
         msg_link_id: MsgLinkId,
     ) -> Result<T, String> {
-        let msg = BroadcastRound::Init(*self.public_key(), data.clone(), recipients.clone());
-        let (_sig, hash) =
+        let (sig, hash) =
             self.get_sig_and_hash(&data, *self.public_key(), &recipients, msg_link_id);
+        let msg = BroadcastRound::Init(*self.public_key(), data.clone(), recipients.clone(), sig);
 
         for rcvr in recipients.iter() {
             self.send_msg(rcvr, &msg, msg_link_id).await;
@@ -82,7 +89,8 @@ impl<T: Data> ProtocolNode<T> {
         bcast_instance.payload = Some(data);
 
         // Send out echo
-        let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(*self.public_key(), hash);
+        let my_sig = self.private_key.sign_echo(hash, msg_link_id);
+        let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(*self.public_key(), hash, my_sig);
         for participant in bcast_instance.participants.iter() {
             if participant == self.public_key() {
                 continue;
@@ -90,30 +98,37 @@ impl<T: Data> ProtocolNode<T> {
             self.send_msg(participant, &echo_msg, msg_link_id).await;
         }
 
-        self.participate_in_broadcast(Some(bcast_instance), msg_link_id)
+        self.participate_in_broadcast_inner(bcast_instance, msg_link_id)
             .await
     }
 
+    pub async fn participate_in_broadcast(&self, msg_link_id: MsgLinkId) -> Result<T, String> {
+        self.participate_in_broadcast_inner(BcastInstance::new(), msg_link_id)
+            .await
+    }
     /// Participate as a recipient of a reliable broadcast
-    pub async fn participate_in_broadcast(
+    async fn participate_in_broadcast_inner(
         &self,
-        bcast_instance: Option<BcastInstance<T>>,
+        bcast_instance: BcastInstance<T>,
         msg_link_id: MsgLinkId,
     ) -> Result<T, String> {
         let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
-        let mut bcast_instance = bcast_instance.unwrap_or(BcastInstance::new());
+        let mut bcast_instance = bcast_instance;
 
-        // TODO: validate signature
         while let Some(msg) = rx.recv().await {
             match msg.data {
-                BroadcastRound::Init(_, data, participants) => {
-                    let hash = canonical_bytes(&data);
+                BroadcastRound::Init(initiator, data, participants, init_sig) => {
+                    // validate Initiator signature
+                    let hash = verify_init(&init_sig, &data, initiator, &participants, msg_link_id)
+                        .expect("Invalid signature");
+
                     bcast_instance.participants = participants;
                     bcast_instance.payload = Some(data);
 
                     // Send out echo
+                    let my_sig = self.private_key.sign_echo(hash, msg_link_id);
                     let echo_msg: BroadcastRound<T> =
-                        BroadcastRound::Echo(*self.public_key(), hash.clone());
+                        BroadcastRound::Echo(*self.public_key(), hash.clone(), my_sig);
                     for participant in bcast_instance.participants.iter() {
                         if participant == self.public_key() {
                             continue;
@@ -145,25 +160,31 @@ impl<T: Data> ProtocolNode<T> {
                         }
                     }
                 }
-                BroadcastRound::Echo(_sender, init_hash) => {
+                BroadcastRound::Echo(sender, init_hash, sender_sig) => {
+                    // Validate sender signature
+                    if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
+                        continue;
+                    }
                     // Skip all counting logic if we've already sent out Ready
                     if bcast_instance.is_ready_msg_sent {
                         continue;
                     }
-                    self.count_echo(&mut bcast_instance, init_hash.clone(), msg_link_id)
-                        .await;
+                    Self::count_echo(&mut bcast_instance, init_hash.clone(), msg_link_id).await;
                     if bcast_instance.echo_threshold_reached {
                         self.send_ready(&mut bcast_instance, init_hash, msg_link_id)
                             .await;
                     }
                 }
-                BroadcastRound::Ready(_sender, hash) => {
-                    Self::count_ready(&mut bcast_instance, hash.clone()).await;
+                BroadcastRound::Ready(sender, init_hash, signature) => {
+                    if verify_ready(sender, init_hash, msg_link_id, signature).is_err() {
+                        continue;
+                    }
+                    Self::count_ready(&mut bcast_instance, init_hash.clone()).await;
                     // Check to see if I should send out Ready amplification
                     if bcast_instance.ready_amp_threshold_reached {
                         // Dont send Ready message if already sent
                         if !bcast_instance.is_ready_msg_sent {
-                            self.send_ready(&mut bcast_instance, hash, msg_link_id)
+                            self.send_ready(&mut bcast_instance, init_hash, msg_link_id)
                                 .await;
                         }
                     }
@@ -184,10 +205,11 @@ impl<T: Data> ProtocolNode<T> {
     async fn send_ready(
         &self,
         bcast_instance: &mut BcastInstance<T>,
-        hash: Sha512HashBytes,
+        hash: HashBytes,
         msg_link_id: MsgLinkId,
     ) {
-        let rdy_msg = BroadcastRound::Ready(*self.public_key(), hash);
+        let sig = self.private_key.sign_ready(hash, msg_link_id);
+        let rdy_msg = BroadcastRound::Ready(*self.public_key(), hash, sig);
         let participants = bcast_instance.participants.clone();
         let public_key = *self.public_key();
         let interface = self.interface.clone();
@@ -209,9 +231,8 @@ impl<T: Data> ProtocolNode<T> {
     }
 
     async fn count_echo(
-        &self,
         bcast_instance: &mut BcastInstance<T>,
-        hash: Sha512HashBytes,
+        hash: HashBytes,
         _msg_link_id: MsgLinkId,
     ) {
         let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
@@ -228,7 +249,7 @@ impl<T: Data> ProtocolNode<T> {
         }
     }
 
-    async fn count_ready(bcast_instance: &mut BcastInstance<T>, hash: Sha512HashBytes) {
+    async fn count_ready(bcast_instance: &mut BcastInstance<T>, hash: HashBytes) {
         let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
         *num_hashes += 1;
 
@@ -253,9 +274,9 @@ impl<T: Data> ProtocolNode<T> {
 
 struct BcastInstance<T> {
     /// How many Echo received for a specific hash
-    hash_echo_count: HashMap<Sha512HashBytes, usize>,
+    hash_echo_count: HashMap<HashBytes, usize>,
     /// How may Ready messages received for a specific hash
-    hash_ready_count: HashMap<Sha512HashBytes, usize>,
+    hash_ready_count: HashMap<HashBytes, usize>,
     is_ready_msg_sent: bool,
     echo_threshold_reached: bool,
     // have I received enough Readys to send out my own Ready to all of the protocol (Ready amplification)
@@ -299,10 +320,302 @@ impl<T> BcastInstance<T> {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub enum BroadcastRound<T> {
-    /// (Initiator, Data, Participants)
-    Init(PublicKeyBytes, T, Vec<PublicKeyBytes>),
+    /// (Initiator, Data, Participants, InitiatorSignature)
+    Init(PublicKeyBytes, T, Vec<PublicKeyBytes>, SignatureBytes),
     /// Sender, Hash
-    Echo(PublicKeyBytes, Sha512HashBytes),
+    Echo(PublicKeyBytes, HashBytes, SignatureBytes),
     /// Sender, Hash
-    Ready(PublicKeyBytes, Sha512HashBytes),
+    Ready(PublicKeyBytes, HashBytes, SignatureBytes),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::PrivateKey;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_broadcast_four_honest_nodes() {
+        // Basic happy path: 4 honest nodes complete a broadcast successfully
+        let node0: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node3: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let pubkey0 = *node0.public_key();
+        let pubkey1 = *node1.public_key();
+        let pubkey2 = *node2.public_key();
+        let pubkey3 = *node3.public_key();
+
+        // Set up address books so everyone knows everyone
+        for node in [&node0, &node1, &node2, &node3] {
+            node.add_addr(node0.public_key, node0.addr()).await;
+            node.add_addr(node1.public_key, node1.addr()).await;
+            node.add_addr(node2.public_key, node2.addr()).await;
+            node.add_addr(node3.public_key, node3.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(100);
+        let broadcast_data = "Important broadcast message".to_string();
+        let participants = vec![pubkey0, pubkey1, pubkey2, pubkey3];
+
+        // Node 0 initiates the broadcast
+        let node0_clone = node0.clone();
+        let data_clone = broadcast_data.clone();
+        let participants_clone = participants.clone();
+        let initiator_task = tokio::spawn(async move {
+            node0_clone
+                .broadcast_init(participants_clone, data_clone, msg_link_id)
+                .await
+        });
+
+        // Other nodes participate
+        let node1_clone = node1.clone();
+        let participant1_task =
+            tokio::spawn(async move { node1_clone.participate_in_broadcast(msg_link_id).await });
+
+        let node2_clone = node2.clone();
+        let participant2_task =
+            tokio::spawn(async move { node2_clone.participate_in_broadcast(msg_link_id).await });
+
+        let node3_clone = node3.clone();
+        let participant3_task =
+            tokio::spawn(async move { node3_clone.participate_in_broadcast(msg_link_id).await });
+
+        // Wait for all to complete
+        let timeout_duration = Duration::from_secs(5);
+
+        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+            .await
+            .expect("Node 0 timed out")
+            .expect("Node 0 task panicked")
+            .expect("Node 0 broadcast failed");
+
+        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
+            .await
+            .expect("Node 1 timed out")
+            .expect("Node 1 task panicked")
+            .expect("Node 1 broadcast failed");
+
+        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
+            .await
+            .expect("Node 2 timed out")
+            .expect("Node 2 task panicked")
+            .expect("Node 2 broadcast failed");
+
+        let result3 = tokio::time::timeout(timeout_duration, participant3_task)
+            .await
+            .expect("Node 3 timed out")
+            .expect("Node 3 task panicked")
+            .expect("Node 3 broadcast failed");
+
+        // Verify all nodes received the same data
+        assert_eq!(result0, broadcast_data);
+        assert_eq!(result1, broadcast_data);
+        assert_eq!(result2, broadcast_data);
+        assert_eq!(result3, broadcast_data);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_messages_arrive_out_of_order() {
+        // Test that the protocol handles out-of-order message delivery
+        // The registry buffers messages, so even if Echo arrives before Init,
+        // the protocol should still complete successfully
+        let node0: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node3: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let pubkey0 = *node0.public_key();
+        let pubkey1 = *node1.public_key();
+        let pubkey2 = *node2.public_key();
+        let pubkey3 = *node3.public_key();
+
+        // Set up address books
+        for node in [&node0, &node1, &node2, &node3] {
+            node.add_addr(pubkey0, node0.addr()).await;
+            node.add_addr(pubkey1, node1.addr()).await;
+            node.add_addr(pubkey2, node2.addr()).await;
+            node.add_addr(pubkey3, node3.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(200);
+        let broadcast_data = "Out of order test".to_string();
+        let participants = vec![pubkey0, pubkey1, pubkey2, pubkey3];
+
+        // Start participant tasks first - they will wait for messages
+        let node1_clone = node1.clone();
+        let participant1_task = tokio::spawn(async move {
+            // Small delay to ensure subscribe happens first
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            node1_clone.participate_in_broadcast(msg_link_id).await
+        });
+
+        let node2_clone = node2.clone();
+        let participant2_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            node2_clone.participate_in_broadcast(msg_link_id).await
+        });
+
+        let node3_clone = node3.clone();
+        let participant3_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            node3_clone.participate_in_broadcast(msg_link_id).await
+        });
+
+        // Small delay to let participants start listening
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now start the broadcast
+        let node0_clone = node0.clone();
+        let data_clone = broadcast_data.clone();
+        let participants_clone = participants.clone();
+        let initiator_task = tokio::spawn(async move {
+            node0_clone
+                .broadcast_init(participants_clone, data_clone, msg_link_id)
+                .await
+        });
+
+        let timeout_duration = Duration::from_secs(5);
+
+        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+            .await
+            .expect("Node 0 timed out")
+            .expect("Node 0 panicked")
+            .expect("Node 0 failed");
+
+        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
+            .await
+            .expect("Node 1 timed out")
+            .expect("Node 1 panicked")
+            .expect("Node 1 failed");
+
+        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
+            .await
+            .expect("Node 2 timed out")
+            .expect("Node 2 panicked")
+            .expect("Node 2 failed");
+
+        let result3 = tokio::time::timeout(timeout_duration, participant3_task)
+            .await
+            .expect("Node 3 timed out")
+            .expect("Node 3 panicked")
+            .expect("Node 3 failed");
+
+        assert_eq!(result0, broadcast_data);
+        assert_eq!(result1, broadcast_data);
+        assert_eq!(result2, broadcast_data);
+        assert_eq!(result3, broadcast_data);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_multiple_concurrent_broadcasts() {
+        // Test multiple broadcasts happening concurrently on the same nodes
+        // Each node initiates its own broadcast simultaneously
+        const NUM_NODES: usize = 6;
+
+        let mut nodes = Vec::new();
+        let mut pubkeys = Vec::new();
+
+        for _ in 0..NUM_NODES {
+            let node: Arc<ProtocolNode<String>> =
+                ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+            pubkeys.push(*node.public_key());
+            nodes.push(node);
+        }
+
+        // Set up address books
+        for node in &nodes {
+            for (idx, &pubkey) in pubkeys.iter().enumerate() {
+                node.add_addr(pubkey, nodes[idx].addr()).await;
+            }
+        }
+
+        let mut all_tasks = Vec::new();
+
+        // Each node initiates its own broadcast
+        for (initiator_idx, initiator_node) in nodes.iter().enumerate() {
+            let msg_link_id = MsgLinkId::new(initiator_idx as u128);
+            let broadcast_data = format!("Message from node {}", initiator_idx);
+            let participants = pubkeys.clone();
+
+            // Initiator task
+            let node_clone = initiator_node.clone();
+            let data_clone = broadcast_data.clone();
+            let participants_clone = participants.clone();
+            let init_task = tokio::spawn(async move {
+                node_clone
+                    .broadcast_init(participants_clone, data_clone.clone(), msg_link_id)
+                    .await
+                    .map(|result| (msg_link_id, result))
+            });
+            all_tasks.push(init_task);
+
+            // Participant tasks for other nodes
+            for (participant_idx, participant_node) in nodes.iter().enumerate() {
+                if participant_idx == initiator_idx {
+                    continue;
+                }
+
+                let node_clone = participant_node.clone();
+                let part_task = tokio::spawn(async move {
+                    node_clone
+                        .participate_in_broadcast(msg_link_id)
+                        .await
+                        .map(|result| (msg_link_id, result))
+                });
+                all_tasks.push(part_task);
+            }
+        }
+
+        // Wait for all tasks
+        let timeout_duration = Duration::from_secs(10);
+        let mut results_by_msg_id = HashMap::new();
+
+        for task in all_tasks {
+            match tokio::time::timeout(timeout_duration, task).await {
+                Ok(Ok(Ok((msg_id, data)))) => {
+                    results_by_msg_id
+                        .entry(msg_id)
+                        .or_insert_with(Vec::new)
+                        .push(data);
+                }
+                Ok(Ok(Err(e))) => panic!("Task failed: {}", e),
+                Ok(Err(e)) => panic!("Task panicked: {:?}", e),
+                Err(_) => panic!("Task timed out"),
+            }
+        }
+
+        // Verify each broadcast was delivered to all nodes with consensus
+        assert_eq!(
+            results_by_msg_id.len(),
+            NUM_NODES,
+            "Should have results for all broadcasts"
+        );
+
+        for (msg_id, results) in results_by_msg_id.iter() {
+            assert_eq!(
+                results.len(),
+                NUM_NODES,
+                "Each broadcast should reach all {} nodes",
+                NUM_NODES
+            );
+
+            // All results for this msg_id should be identical
+            let first = &results[0];
+            assert!(
+                results.iter().all(|r| r == first),
+                "All nodes should agree on broadcast {:?}",
+                msg_id
+            );
+        }
+    }
 }

@@ -6,7 +6,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio;
 use tokio::net::ToSocketAddrs;
 
-use crate::crypto::{PublicKey, PublicKeyBytes};
+use crate::crypto::PublicKeyBytes;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::server::ServerBuilder;
 use tokio::sync::{Mutex, mpsc, mpsc::Receiver, mpsc::Sender};
@@ -97,7 +97,7 @@ impl<T> Registry<T> {
             return Err(format!("no active channel for {:?}", msg.get_msg_id()));
         };
         return tx
-            .send_timeout(msg, Duration::from_secs(1))
+            .send_timeout(msg, Duration::from_secs(2))
             .await
             .map_err(|e| e.to_string());
     }
@@ -226,7 +226,7 @@ impl<T: Data> Interface<T> {
         client.clone()
     }
 
-    pub async fn add_addr(&self, pubkey: PublicKey, addr: SocketAddr) {
-        self.addr_book.lock().await.insert(pubkey.to_bytes(), addr);
+    pub async fn add_addr(&self, pubkey: PublicKeyBytes, addr: SocketAddr) {
+        self.addr_book.lock().await.insert(pubkey, addr);
     }
 }
