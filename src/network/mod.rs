@@ -97,7 +97,7 @@ impl<T> Registry<T> {
             return Err(format!("no active channel for {:?}", msg.get_msg_id()));
         };
         return tx
-            .send_timeout(msg, Duration::from_secs(2))
+            .send_timeout(msg, Duration::from_secs(1))
             .await
             .map_err(|e| e.to_string());
     }

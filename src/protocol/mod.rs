@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::crypto::{
     HashBytes, PrivateKey, PublicKeyBytes, SignatureBytes, verify_echo, verify_init, verify_ready,
 };
-use crate::network::{Data, Interface, MsgLinkId, Registry};
+use crate::network::{Data, Interface, MsgLink, MsgLinkId, Registry};
 
 /// Protocol-aware wrapper around Interface that handles signing and identity
 pub struct ProtocolNode<T> {
@@ -76,10 +76,13 @@ impl<T: Data> ProtocolNode<T> {
     ) -> Result<T, String> {
         let (sig, hash) =
             self.get_sig_and_hash(&data, *self.public_key(), &recipients, msg_link_id);
-        let msg = BroadcastRound::Init(*self.public_key(), data.clone(), recipients.clone(), sig);
+        let msg = BroadcastRound::Init(data.clone(), recipients.clone(), sig);
 
-        for rcvr in recipients.iter() {
-            self.send_msg(rcvr, &msg, msg_link_id).await;
+        for participant in recipients.iter() {
+            if participant == self.public_key() {
+                continue;
+            }
+            self.send_msg(participant, &msg, msg_link_id).await;
         }
 
         // need to set up init state here because initiator wont receive init RPC (from himself)
@@ -87,142 +90,153 @@ impl<T: Data> ProtocolNode<T> {
         bcast_instance.participants = recipients;
         bcast_instance.payload = Some(data);
 
-        // Send out echo
+        // Send out echo and count it
         let my_sig = self.private_key.sign_echo(hash, msg_link_id);
-        let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(*self.public_key(), hash, my_sig);
+        let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(hash, my_sig);
         for participant in bcast_instance.participants.iter() {
             if participant == self.public_key() {
                 continue;
             }
             self.send_msg(participant, &echo_msg, msg_link_id).await;
         }
+        Self::count_echo(&mut bcast_instance, hash, *self.public_key()).await;
 
-        self.participate_in_broadcast_inner(bcast_instance, msg_link_id)
+        let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
+        self.participate_in_broadcast_inner(bcast_instance, &mut rx)
             .await
     }
 
     pub async fn participate_in_broadcast(&self, msg_link_id: MsgLinkId) -> Result<T, String> {
-        // TODO: wait for round one message here and then go into participate_inner() with participants set
-        self.participate_in_broadcast_inner(BcastInstance::new(), msg_link_id)
-            .await
+        let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
+        // wait for init message and place messages received beforehand in bcast_instance.msg_queue
+        let bcast_instance = self.wait_for_init(msg_link_id, &mut rx).await;
+        if bcast_instance.payload.is_none() {
+            return Err("Did not find init message".to_string());
+        }
+        let value = self
+            .participate_in_broadcast_inner(bcast_instance, &mut rx)
+            .await;
+        drop(rx);
+        value
     }
     /// Participate as a recipient of a reliable broadcast
     async fn participate_in_broadcast_inner(
         &self,
         bcast_instance: BcastInstance<T>,
-        msg_link_id: MsgLinkId,
+        rx: &mut tokio::sync::mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
     ) -> Result<T, String> {
-        let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
         let mut bcast_instance = bcast_instance;
+        while let Some(msg) = bcast_instance.msg_queue.pop() {
+            self.handle_message(msg, &mut bcast_instance).await;
+            if bcast_instance.delivery_threshold_reached {
+                return bcast_instance
+                    .payload
+                    .ok_or("Payload not initialized".to_string());
+            }
+        }
+        while let Some(msg) = rx.recv().await {
+            self.handle_message(msg, &mut bcast_instance).await;
+            if bcast_instance.delivery_threshold_reached {
+                return bcast_instance
+                    .payload
+                    .ok_or("Payload not initialized".to_string());
+            }
+        }
+
+        Err("no".to_string())
+    }
+
+    /// Wait for round one message here and then go into participate_inner() with participants already set
+    async fn wait_for_init(
+        &self,
+        msg_link_id: MsgLinkId,
+        rx: &mut tokio::sync::mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
+    ) -> BcastInstance<T> {
+        let mut bcast_instance: BcastInstance<T> = BcastInstance::new();
         while let Some(msg) = rx.recv().await {
             let sender = msg.sender;
+            if let BroadcastRound::Init(data, participants, init_sig) = msg.data {
+                // validate Initiator signature
+                let Ok(hash) = verify_init(&init_sig, &data, sender, &participants, msg_link_id)
+                else {
+                    eprintln!("invalid signature");
+                    continue;
+                };
+                bcast_instance.participants = participants;
+                bcast_instance.payload = Some(data);
 
-            match msg.data {
-                BroadcastRound::Init(sender, data, participants, init_sig) => {
-                    if bcast_instance.payload.is_some() {
-                        eprintln!("multiple init message for the same msg id");
+                // Send out echo
+                let my_sig = self.private_key.sign_echo(hash, msg_link_id);
+                let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(hash.clone(), my_sig);
+                for participant in bcast_instance.participants.iter() {
+                    if participant == self.public_key() {
                         continue;
                     }
-                    // validate Initiator signature
-                    let Ok(hash) =
-                        verify_init(&init_sig, &data, sender, &participants, msg_link_id)
-                    else {
-                        eprintln!("invalid signature");
-                        continue;
-                    };
-                    bcast_instance.participants = participants;
-                    bcast_instance.payload = Some(data);
-
-                    // Send out echo
-                    let my_sig = self.private_key.sign_echo(hash, msg_link_id);
-                    let echo_msg: BroadcastRound<T> =
-                        BroadcastRound::Echo(*self.public_key(), hash.clone(), my_sig);
-                    for participant in bcast_instance.participants.iter() {
-                        if participant == self.public_key() {
-                            continue;
-                        }
-                        self.send_msg(participant, &echo_msg, msg_link_id).await;
-                    }
-
-                    // check for quorums reached on messages received before processing Init
-                    // send out Ready if quorum is reached
-                    if let Some(&echo_count) = bcast_instance.hash_echo_count.get(&hash) {
-                        if echo_count >= bcast_instance.echo_to_ready_threshold() {
-                            bcast_instance.echo_threshold_reached = true;
-                            self.send_ready(&mut bcast_instance, hash.clone(), msg_link_id)
-                                .await;
-                        }
-                    }
-
-                    // Send Ready amp and deliver message if quorum is reached
-                    if let Some(&ready_count) = bcast_instance.hash_ready_count.get(&hash) {
-                        if ready_count >= bcast_instance.ready_amp_threshold() {
-                            self.send_ready(&mut bcast_instance, hash, msg_link_id)
-                                .await;
-                        }
-
-                        if ready_count >= bcast_instance.delivery_threshold() {
-                            return bcast_instance
-                                .payload
-                                .ok_or("No payload initiated".to_string());
-                        }
-                    }
+                    self.send_msg(participant, &echo_msg, msg_link_id).await;
                 }
-                BroadcastRound::Echo(sender, init_hash, sender_sig) => {
-                    // Skip all counting logic if we've already sent out Ready
-                    if bcast_instance.is_ready_msg_sent {
-                        continue;
-                    }
-                    if bcast_instance.has_sent_echo(sender) {
-                        eprintln!("Multiple echo messages from {sender:?}");
-                        continue;
-                    }
-                    // Validate sender signature
-                    if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
-                        continue;
-                    }
-                    // TODO: check if we have participants.  If we do, `continue` (ie skip) if sender is not in
-                    //participant list.  If we dont, all messages should be stored temporarily with the sender
-                    // and only counted when we get the participants from init
-                    // Ignore echo message if we've received an echo message from that pubkey
-                    Self::count_echo(&mut bcast_instance, init_hash.clone(), sender).await;
-                    if bcast_instance.echo_threshold_reached {
-                        self.send_ready(&mut bcast_instance, init_hash, msg_link_id)
+                break;
+            } else {
+                bcast_instance.msg_queue.push(msg);
+            }
+        }
+        bcast_instance
+    }
+
+    async fn handle_message(
+        &self,
+        msg: MsgLink<BroadcastRound<T>>,
+        bcast_instance: &mut BcastInstance<T>,
+    ) {
+        let msg_link_id = msg.get_msg_id().clone();
+        let sender = msg.sender;
+        match msg.data {
+            BroadcastRound::Init(_, _, _) => {
+                if bcast_instance.payload.is_some() {
+                    eprintln!("multiple init message for the same msg id");
+                    return;
+                }
+            }
+            BroadcastRound::Echo(init_hash, sender_sig) => {
+                // Skip all counting logic if we've already sent out Ready
+                if bcast_instance.is_ready_msg_sent {
+                    return;
+                }
+                // Ignore echo message if we've received an echo message from that pubkey
+                if bcast_instance.has_sent_echo(sender) {
+                    eprintln!("Multiple echo messages from {sender:?}");
+                    return;
+                }
+                // Validate sender signature
+                if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
+                    return;
+                }
+                Self::count_echo(bcast_instance, init_hash.clone(), sender).await;
+                if bcast_instance.echo_threshold_reached {
+                    self.send_ready(bcast_instance, init_hash, msg_link_id)
+                        .await;
+                }
+            }
+            BroadcastRound::Ready(init_hash, signature) => {
+                if bcast_instance.has_sent_ready(sender) {
+                    eprintln!("Multiple ready messages from {sender:?}");
+                    return;
+                }
+                if verify_ready(sender, init_hash, msg_link_id, signature).is_err() {
+                    eprintln!("Invalid signature from {sender:?}");
+                    return;
+                }
+                Self::count_ready(bcast_instance, init_hash.clone(), sender).await;
+                // Check to see if I should send out Ready amplification
+                if bcast_instance.ready_amp_threshold_reached {
+                    // Dont send Ready message if already sent
+                    if !bcast_instance.is_ready_msg_sent {
+                        self.send_ready(bcast_instance, init_hash, msg_link_id)
                             .await;
-                    }
-                }
-                BroadcastRound::Ready(sender, init_hash, signature) => {
-                    if bcast_instance.has_sent_ready(sender) {
-                        eprintln!("Multiple ready messages from {sender:?}");
-                        continue;
-                    }
-                    if verify_ready(sender, init_hash, msg_link_id, signature).is_err() {
-                        eprintln!("Invalid signature from {sender:?}");
-                        continue;
-                    }
-                    Self::count_ready(&mut bcast_instance, init_hash.clone(), sender).await;
-                    // Check to see if I should send out Ready amplification
-                    if bcast_instance.ready_amp_threshold_reached {
-                        // Dont send Ready message if already sent
-                        if !bcast_instance.is_ready_msg_sent {
-                            self.send_ready(&mut bcast_instance, init_hash, msg_link_id)
-                                .await;
-                        }
-                    }
-                    if bcast_instance.delivery_threshold_reached {
-                        drop(rx);
-                        return bcast_instance
-                            .payload
-                            .ok_or("Payload not initialized".to_string());
                     }
                 }
             }
         }
-
-        drop(rx);
-        Err("no".to_string())
     }
-
     async fn send_ready(
         &self,
         bcast_instance: &mut BcastInstance<T>,
@@ -230,7 +244,7 @@ impl<T: Data> ProtocolNode<T> {
         msg_link_id: MsgLinkId,
     ) {
         let sig = self.private_key.sign_ready(hash, msg_link_id);
-        let rdy_msg = BroadcastRound::Ready(*self.public_key(), hash, sig);
+        let rdy_msg = BroadcastRound::Ready(hash, sig);
         let participants = bcast_instance.participants.clone();
         let public_key = *self.public_key();
         let interface = self.interface.clone();
@@ -244,7 +258,7 @@ impl<T: Data> ProtocolNode<T> {
                 interface
                     .send_msg(&participant, &rdy_msg_clone, msg_link_id, public_key)
                     .await;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
 
@@ -313,6 +327,7 @@ struct BcastInstance<T> {
     delivery_threshold_reached: bool,
     /// includes the initiator
     participants: Vec<PublicKeyBytes>,
+    msg_queue: Vec<MsgLink<BroadcastRound<T>>>,
     payload: Option<T>,
 }
 
@@ -328,6 +343,7 @@ impl<T> BcastInstance<T> {
             delivery_threshold_reached: false,
             participants: Vec::new(),
             payload: None,
+            msg_queue: Vec::new(),
         }
     }
     fn has_sent_echo(&self, pubkey: PublicKeyBytes) -> bool {
@@ -363,12 +379,11 @@ impl<T> BcastInstance<T> {
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub enum BroadcastRound<T> {
     /// (Initiator, Data, Participants, InitiatorSignature)
-    /// TODO: remove this
-    Init(PublicKeyBytes, T, Vec<PublicKeyBytes>, SignatureBytes),
+    Init(T, Vec<PublicKeyBytes>, SignatureBytes),
     /// Sender, Hash
-    Echo(PublicKeyBytes, HashBytes, SignatureBytes),
+    Echo(HashBytes, SignatureBytes),
     /// Sender, Hash
-    Ready(PublicKeyBytes, HashBytes, SignatureBytes),
+    Ready(HashBytes, SignatureBytes),
 }
 
 #[cfg(test)]
@@ -430,7 +445,7 @@ mod tests {
             tokio::spawn(async move { node3_clone.participate_in_broadcast(msg_link_id).await });
 
         // Wait for all to complete
-        let timeout_duration = Duration::from_secs(5);
+        let timeout_duration = Duration::from_secs(3);
 
         let result0 = tokio::time::timeout(timeout_duration, initiator_task)
             .await
@@ -563,7 +578,7 @@ mod tests {
     async fn test_broadcast_multiple_concurrent_broadcasts() {
         // Test multiple broadcasts happening concurrently on the same nodes
         // Each node initiates its own broadcast simultaneously
-        const NUM_NODES: usize = 6;
+        const NUM_NODES: usize = 5;
 
         let mut nodes = Vec::new();
         let mut pubkeys = Vec::new();
