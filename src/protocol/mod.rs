@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::crypto::{
@@ -165,7 +165,7 @@ impl<T: Data> ProtocolNode<T> {
                 bcast_instance.participants = participants;
                 bcast_instance.payload = Some(data);
 
-                // Send out echo
+                // Send out echo and count
                 let my_sig = self.private_key.sign_echo(hash, msg_link_id);
                 let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(hash.clone(), my_sig);
                 for participant in bcast_instance.participants.iter() {
@@ -174,6 +174,7 @@ impl<T: Data> ProtocolNode<T> {
                     }
                     self.send_msg(participant, &echo_msg, msg_link_id).await;
                 }
+                Self::count_echo(&mut bcast_instance, hash, sender).await;
                 break;
             } else {
                 bcast_instance.msg_queue.push(msg);
