@@ -45,7 +45,7 @@ impl<T: Data> ProtocolNode<T> {
         self.interface.add_addr(pubkey, addr).await;
     }
 
-    fn get_sig_and_hash<S: serde::Serialize>(
+    fn sign_and_hash<S: serde::Serialize>(
         &self,
         data: &S,
         initiator: PublicKeyBytes,
@@ -74,8 +74,7 @@ impl<T: Data> ProtocolNode<T> {
         data: T,
         msg_link_id: MsgLinkId,
     ) -> Result<T, String> {
-        let (sig, hash) =
-            self.get_sig_and_hash(&data, *self.public_key(), &recipients, msg_link_id);
+        let (sig, hash) = self.sign_and_hash(&data, *self.public_key(), &recipients, msg_link_id);
         let msg = BroadcastRound::Init(data.clone(), recipients.clone(), sig);
 
         for participant in recipients.iter() {
@@ -99,7 +98,7 @@ impl<T: Data> ProtocolNode<T> {
             }
             self.send_msg(participant, &echo_msg, msg_link_id).await;
         }
-        Self::count_echo(&mut bcast_instance, hash, *self.public_key()).await;
+        bcast_instance.count_echo(hash, *self.public_key()).await;
 
         let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
         self.participate_in_broadcast_inner(bcast_instance, &mut rx)
@@ -174,7 +173,7 @@ impl<T: Data> ProtocolNode<T> {
                     }
                     self.send_msg(participant, &echo_msg, msg_link_id).await;
                 }
-                Self::count_echo(&mut bcast_instance, hash, sender).await;
+                bcast_instance.count_echo(hash, sender).await;
                 break;
             } else {
                 bcast_instance.msg_queue.push(msg);
@@ -211,7 +210,7 @@ impl<T: Data> ProtocolNode<T> {
                 if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
                     return;
                 }
-                Self::count_echo(bcast_instance, init_hash.clone(), sender).await;
+                bcast_instance.count_echo(init_hash.clone(), sender).await;
                 if bcast_instance.echo_threshold_reached {
                     self.send_ready(bcast_instance, init_hash, msg_link_id)
                         .await;
@@ -226,7 +225,7 @@ impl<T: Data> ProtocolNode<T> {
                     eprintln!("Invalid signature from {sender:?}");
                     return;
                 }
-                Self::count_ready(bcast_instance, init_hash.clone(), sender).await;
+                bcast_instance.count_ready(init_hash.clone(), sender).await;
                 // Check to see if I should send out Ready amplification
                 if bcast_instance.ready_amp_threshold_reached {
                     // Dont send Ready message if already sent
@@ -264,52 +263,6 @@ impl<T: Data> ProtocolNode<T> {
         });
 
         bcast_instance.is_ready_msg_sent = true;
-    }
-
-    async fn count_echo(
-        bcast_instance: &mut BcastInstance<T>,
-        hash: HashBytes,
-        sender: PublicKeyBytes,
-    ) {
-        let num_hashes = bcast_instance.hash_echo_count.entry(hash).or_insert(0);
-        *num_hashes += 1;
-        let count = *num_hashes;
-        bcast_instance.sent_echo(sender);
-        // Can't check quorum if Init message hasnt been processed
-        if bcast_instance.payload.is_none() {
-            return;
-        }
-
-        // Send Ready out and mark flag to not send multiple Ready(s) out
-        if count >= bcast_instance.echo_to_ready_threshold() {
-            bcast_instance.echo_threshold_reached = true;
-        }
-    }
-
-    async fn count_ready(
-        bcast_instance: &mut BcastInstance<T>,
-        hash: HashBytes,
-        sender: PublicKeyBytes,
-    ) {
-        let num_hashes = bcast_instance.hash_ready_count.entry(hash).or_insert(0);
-        *num_hashes += 1;
-        let count = *num_hashes;
-        bcast_instance.sent_ready(sender);
-
-        // Can't check quorum if Init message hasnt been processed
-        if bcast_instance.payload.is_none() {
-            return;
-        }
-
-        // Have I reached threshold of Readys to send my own Ready
-        if count >= bcast_instance.ready_amp_threshold() {
-            bcast_instance.ready_amp_threshold_reached = true;
-        }
-
-        // Check for delivery threshold
-        if count >= bcast_instance.delivery_threshold() {
-            bcast_instance.delivery_threshold_reached = true;
-        }
     }
 }
 
@@ -374,6 +327,44 @@ impl<T> BcastInstance<T> {
     fn delivery_threshold(&self) -> usize {
         let n = self.participants.len();
         (((n - 1) / 3) * 2) + 1
+    }
+
+    async fn count_echo(&mut self, hash: HashBytes, sender: PublicKeyBytes) {
+        let num_hashes = self.hash_echo_count.entry(hash).or_insert(0);
+        *num_hashes += 1;
+        let count = *num_hashes;
+        self.sent_echo(sender);
+        // Can't check quorum if Init message hasnt been processed
+        if self.payload.is_none() {
+            return;
+        }
+
+        // Send Ready out and mark flag to not send multiple Ready(s) out
+        if count >= self.echo_to_ready_threshold() {
+            self.echo_threshold_reached = true;
+        }
+    }
+
+    async fn count_ready(&mut self, hash: HashBytes, sender: PublicKeyBytes) {
+        let num_hashes = self.hash_ready_count.entry(hash).or_insert(0);
+        *num_hashes += 1;
+        let count = *num_hashes;
+        self.sent_ready(sender);
+
+        // Can't check quorum if Init message hasnt been processed
+        if self.payload.is_none() {
+            return;
+        }
+
+        // Have I reached threshold of Readys to send my own Ready
+        if count >= self.ready_amp_threshold() {
+            self.ready_amp_threshold_reached = true;
+        }
+
+        // Check for delivery threshold
+        if count >= self.delivery_threshold() {
+            self.delivery_threshold_reached = true;
+        }
     }
 }
 
