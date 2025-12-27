@@ -56,15 +56,46 @@ impl<T: Data> ProtocolNode<T> {
             .sig_and_hash(data, initiator, participants, msg_link_id)
     }
 
-    async fn send_msg(
+    async fn send_echo(
         &self,
-        rcvr: &PublicKeyBytes,
-        msg: &BroadcastRound<T>,
+        bcast_instance: &mut BcastInstance<T>,
+        hash: HashBytes,
         msg_link_id: MsgLinkId,
     ) {
-        self.interface
-            .send_msg(rcvr, msg, msg_link_id, self.public_key)
-            .await;
+        println!("{:?} sending echo to protocol", self.public_key);
+        let my_sig = self.private_key.sign_echo(hash, msg_link_id);
+        let echo_msg = BroadcastRound::Echo(hash, my_sig);
+
+        for participant in bcast_instance.participants.iter() {
+            if participant == self.public_key() {
+                continue;
+            }
+            self.interface
+                .send_msg(participant, &echo_msg, msg_link_id, self.public_key)
+                .await;
+        }
+        bcast_instance.count_echo(hash, *self.public_key()).await;
+    }
+
+    async fn send_ready(
+        &self,
+        bcast_instance: &mut BcastInstance<T>,
+        hash: HashBytes,
+        msg_link_id: MsgLinkId,
+    ) {
+        let sig = self.private_key.sign_ready(hash, msg_link_id);
+        let rdy_msg = BroadcastRound::Ready(hash, sig);
+
+        for participant in bcast_instance.participants.iter() {
+            if participant == self.public_key() {
+                continue;
+            }
+            self.interface
+                .send_msg(participant, &rdy_msg, msg_link_id, self.public_key)
+                .await;
+        }
+        bcast_instance.count_ready(hash, *self.public_key()).await;
+        bcast_instance.is_ready_msg_sent = true;
     }
 
     /// Start a reliable broadcast and participate in it
@@ -81,7 +112,9 @@ impl<T: Data> ProtocolNode<T> {
             if participant == self.public_key() {
                 continue;
             }
-            self.send_msg(participant, &msg, msg_link_id).await;
+            self.interface
+                .send_msg(participant, &msg, msg_link_id, self.public_key)
+                .await;
         }
 
         // need to set up init state here because initiator wont receive init RPC (from himself)
@@ -90,15 +123,7 @@ impl<T: Data> ProtocolNode<T> {
         bcast_instance.payload = Some(data);
 
         // Send out echo and count it
-        let my_sig = self.private_key.sign_echo(hash, msg_link_id);
-        let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(hash, my_sig);
-        for participant in bcast_instance.participants.iter() {
-            if participant == self.public_key() {
-                continue;
-            }
-            self.send_msg(participant, &echo_msg, msg_link_id).await;
-        }
-        bcast_instance.count_echo(hash, *self.public_key()).await;
+        self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
 
         let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
         self.participate_in_broadcast_inner(bcast_instance, &mut rx)
@@ -165,15 +190,7 @@ impl<T: Data> ProtocolNode<T> {
                 bcast_instance.payload = Some(data);
 
                 // Send out echo and count
-                let my_sig = self.private_key.sign_echo(hash, msg_link_id);
-                let echo_msg: BroadcastRound<T> = BroadcastRound::Echo(hash.clone(), my_sig);
-                for participant in bcast_instance.participants.iter() {
-                    if participant == self.public_key() {
-                        continue;
-                    }
-                    self.send_msg(participant, &echo_msg, msg_link_id).await;
-                }
-                bcast_instance.count_echo(hash, sender).await;
+                self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
                 break;
             } else {
                 bcast_instance.msg_queue.push(msg);
@@ -237,33 +254,6 @@ impl<T: Data> ProtocolNode<T> {
             }
         }
     }
-    async fn send_ready(
-        &self,
-        bcast_instance: &mut BcastInstance<T>,
-        hash: HashBytes,
-        msg_link_id: MsgLinkId,
-    ) {
-        let sig = self.private_key.sign_ready(hash, msg_link_id);
-        let rdy_msg = BroadcastRound::Ready(hash, sig);
-        let participants = bcast_instance.participants.clone();
-        let public_key = *self.public_key();
-        let interface = self.interface.clone();
-
-        tokio::task::spawn(async move {
-            for participant in participants {
-                if participant == public_key {
-                    continue;
-                }
-                let rdy_msg_clone = rdy_msg.clone();
-                interface
-                    .send_msg(&participant, &rdy_msg_clone, msg_link_id, public_key)
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
-
-        bcast_instance.is_ready_msg_sent = true;
-    }
 }
 
 struct BcastInstance<T> {
@@ -316,7 +306,7 @@ impl<T> BcastInstance<T> {
     }
     fn echo_to_ready_threshold(&self) -> usize {
         let n = self.participants.len();
-        (n + ((n - 1) / 3) + 1).div_ceil(2)
+        (n + ((n - 1) / 3)).div_ceil(2)
     }
 
     fn ready_amp_threshold(&self) -> usize {
@@ -334,10 +324,6 @@ impl<T> BcastInstance<T> {
         *num_hashes += 1;
         let count = *num_hashes;
         self.sent_echo(sender);
-        // Can't check quorum if Init message hasnt been processed
-        if self.payload.is_none() {
-            return;
-        }
 
         // Send Ready out and mark flag to not send multiple Ready(s) out
         if count >= self.echo_to_ready_threshold() {
@@ -350,11 +336,6 @@ impl<T> BcastInstance<T> {
         *num_hashes += 1;
         let count = *num_hashes;
         self.sent_ready(sender);
-
-        // Can't check quorum if Init message hasnt been processed
-        if self.payload.is_none() {
-            return;
-        }
 
         // Have I reached threshold of Readys to send my own Ready
         if count >= self.ready_amp_threshold() {
@@ -380,6 +361,8 @@ pub enum BroadcastRound<T> {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SecretKey;
+
     use super::*;
     use crate::crypto::PrivateKey;
     use std::time::Duration;
@@ -570,7 +553,7 @@ mod tests {
     async fn test_broadcast_multiple_concurrent_broadcasts() {
         // Test multiple broadcasts happening concurrently on the same nodes
         // Each node initiates its own broadcast simultaneously
-        const NUM_NODES: usize = 5;
+        const NUM_NODES: usize = 10;
 
         let mut nodes = Vec::new();
         let mut pubkeys = Vec::new();
