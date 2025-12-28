@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 use crate::crypto::{
     HashBytes, PrivateKey, PublicKeyBytes, SignatureBytes, verify_echo, verify_init, verify_ready,
 };
@@ -118,9 +120,7 @@ impl<T: Data> ProtocolNode<T> {
         }
 
         // need to set up init state here because initiator wont receive init RPC (from himself)
-        let mut bcast_instance = BcastInstance::new();
-        bcast_instance.participants = recipients;
-        bcast_instance.payload = Some(data);
+        let mut bcast_instance = BcastInstance::new(data, hash, recipients);
 
         // Send out echo and count it
         self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
@@ -134,9 +134,9 @@ impl<T: Data> ProtocolNode<T> {
         let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
         // wait for init message and place messages received beforehand in bcast_instance.msg_queue
         let bcast_instance = self.wait_for_init(msg_link_id, &mut rx).await;
-        if bcast_instance.payload.is_none() {
+        let Some(bcast_instance) = bcast_instance else {
             return Err("Did not find init message".to_string());
-        }
+        };
         let value = self
             .participate_in_broadcast_inner(bcast_instance, &mut rx)
             .await;
@@ -147,36 +147,33 @@ impl<T: Data> ProtocolNode<T> {
     async fn participate_in_broadcast_inner(
         &self,
         bcast_instance: BcastInstance<T>,
-        rx: &mut tokio::sync::mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
+        rx: &mut mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
     ) -> Result<T, String> {
         let mut bcast_instance = bcast_instance;
         while let Some(msg) = bcast_instance.msg_queue.pop() {
             self.handle_message(msg, &mut bcast_instance).await;
             if bcast_instance.delivery_threshold_reached {
-                return bcast_instance
-                    .payload
-                    .ok_or("Payload not initialized".to_string());
+                return Ok(bcast_instance.payload);
             }
         }
         while let Some(msg) = rx.recv().await {
             self.handle_message(msg, &mut bcast_instance).await;
             if bcast_instance.delivery_threshold_reached {
-                return bcast_instance
-                    .payload
-                    .ok_or("Payload not initialized".to_string());
+                return Ok(bcast_instance.payload);
             }
         }
 
-        Err("no".to_string())
+        Err("Delivery threshold not met".to_string())
     }
 
     /// Wait for round one message here and then go into participate_inner() with participants already set
     async fn wait_for_init(
         &self,
         msg_link_id: MsgLinkId,
-        rx: &mut tokio::sync::mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
-    ) -> BcastInstance<T> {
-        let mut bcast_instance: BcastInstance<T> = BcastInstance::new();
+        rx: &mut mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
+    ) -> Option<BcastInstance<T>> {
+        let mut instance_opt: Option<BcastInstance<T>> = None;
+        let mut msg_queue = Vec::new();
         while let Some(msg) = rx.recv().await {
             let sender = msg.sender;
             if let BroadcastRound::Init(data, participants, init_sig) = msg.data {
@@ -186,17 +183,19 @@ impl<T: Data> ProtocolNode<T> {
                     eprintln!("invalid signature");
                     continue;
                 };
-                bcast_instance.participants = participants;
-                bcast_instance.payload = Some(data);
-
+                let mut bcast_instance = BcastInstance::new(data, hash, participants);
                 // Send out echo and count
                 self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
+                instance_opt = Some(bcast_instance);
                 break;
             } else {
-                bcast_instance.msg_queue.push(msg);
+                msg_queue.push(msg);
             }
         }
-        bcast_instance
+        if let Some(inst) = instance_opt.as_mut() {
+            inst.msg_queue = msg_queue;
+        }
+        instance_opt
     }
 
     async fn handle_message(
@@ -208,12 +207,15 @@ impl<T: Data> ProtocolNode<T> {
         let sender = msg.sender;
         match msg.data {
             BroadcastRound::Init(_, _, _) => {
-                if bcast_instance.payload.is_some() {
-                    eprintln!("multiple init message for the same msg id");
-                    return;
-                }
+                eprintln!("multiple init message for the same msg id");
+                return;
             }
             BroadcastRound::Echo(init_hash, sender_sig) => {
+                // Don't run any verification logic if hash does not match initiator's message hash
+                if init_hash != bcast_instance.payload_hash {
+                    eprintln!("Received Echo containing a different hash");
+                    return;
+                }
                 // Skip all counting logic if we've already sent out Ready
                 if bcast_instance.is_ready_msg_sent {
                     return;
@@ -234,6 +236,11 @@ impl<T: Data> ProtocolNode<T> {
                 }
             }
             BroadcastRound::Ready(init_hash, signature) => {
+                // Don't run any verification logic if hash does not match initiator's message hash
+                if init_hash != bcast_instance.payload_hash {
+                    eprintln!("Received Ready containing a different hash");
+                    return;
+                }
                 if bcast_instance.has_sent_ready(sender) {
                     eprintln!("Multiple ready messages from {sender:?}");
                     return;
@@ -272,11 +279,12 @@ struct BcastInstance<T> {
     /// includes the initiator
     participants: Vec<PublicKeyBytes>,
     msg_queue: Vec<MsgLink<BroadcastRound<T>>>,
-    payload: Option<T>,
+    payload: T,
+    payload_hash: HashBytes,
 }
 
 impl<T> BcastInstance<T> {
-    fn new() -> Self {
+    fn new(payload: T, payload_hash: HashBytes, participants: Vec<PublicKeyBytes>) -> Self {
         Self {
             hash_echo_count: HashMap::new(),
             hash_ready_count: HashMap::new(),
@@ -285,8 +293,9 @@ impl<T> BcastInstance<T> {
             echo_threshold_reached: false,
             ready_amp_threshold_reached: false,
             delivery_threshold_reached: false,
-            participants: Vec::new(),
-            payload: None,
+            participants,
+            payload,
+            payload_hash,
             msg_queue: Vec::new(),
         }
     }
