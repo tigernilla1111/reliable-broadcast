@@ -15,14 +15,32 @@ pub struct ProtocolNode<T> {
     public_key: PublicKeyBytes,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    #[error("delivery threshold not met")]
+    DeliveryThresholdNotMet,
+
+    #[error("init message not received")]
+    InitMessageNotReceived,
+
+    #[error("failed to subscribe to msg_link_id {0:?}")]
+    SubscriptionFailed(MsgLinkId),
+
+    #[error("broadcast timed out after {0} seconds")]
+    Timeout(u64),
+
+    #[error("failed to sign message {0}")]
+    SigningFailed(String),
+}
+
 impl<T: Data> ProtocolNode<T> {
     pub async fn new(addr: impl tokio::net::ToSocketAddrs, private_key: PrivateKey) -> Arc<Self> {
-        let public_key = private_key.to_public_key();
+        let public_key = private_key.public_key();
         let interface = Interface::new(addr).await;
 
         Arc::new(Self {
             interface,
-            private_key: private_key,
+            private_key,
             public_key,
         })
     }
@@ -47,16 +65,16 @@ impl<T: Data> ProtocolNode<T> {
         self.interface.add_addr(pubkey, addr).await;
     }
 
-    fn sign_and_hash<S: serde::Serialize>(
-        &self,
-        data: &S,
-        initiator: PublicKeyBytes,
-        participants: &Vec<PublicKeyBytes>,
-        msg_link_id: MsgLinkId,
-    ) -> (SignatureBytes, HashBytes) {
-        self.private_key
-            .sig_and_hash(data, initiator, participants, msg_link_id)
-    }
+    // fn sign_and_hash<S: serde::Serialize>(
+    //     &self,
+    //     data: &S,
+    //     initiator: PublicKeyBytes,
+    //     participants: &Vec<PublicKeyBytes>,
+    //     msg_link_id: MsgLinkId,
+    // ) -> (SignatureBytes, HashBytes) {
+    //     self.private_key
+    //         .sign_init(data, initiator, participants, msg_link_id)
+    // }
 
     async fn send_echo(
         &self,
@@ -64,7 +82,12 @@ impl<T: Data> ProtocolNode<T> {
         hash: HashBytes,
         msg_link_id: MsgLinkId,
     ) {
-        println!("{:?} sending echo to protocol", self.public_key);
+        tracing::debug!(
+            node = ?self.public_key,
+            msg_link_id = ?msg_link_id,
+            "sending echo messages"
+        );
+
         let my_sig = self.private_key.sign_echo(hash, msg_link_id);
         let echo_msg = BroadcastRound::Echo(hash, my_sig);
 
@@ -85,6 +108,12 @@ impl<T: Data> ProtocolNode<T> {
         hash: HashBytes,
         msg_link_id: MsgLinkId,
     ) {
+        tracing::debug!(
+            node = ?self.public_key,
+            msg_link_id = ?msg_link_id,
+            "sending ready messages"
+        );
+
         let sig = self.private_key.sign_ready(hash, msg_link_id);
         let rdy_msg = BroadcastRound::Ready(hash, sig);
 
@@ -106,8 +135,11 @@ impl<T: Data> ProtocolNode<T> {
         recipients: Vec<PublicKeyBytes>,
         data: T,
         msg_link_id: MsgLinkId,
-    ) -> Result<T, String> {
-        let (sig, hash) = self.sign_and_hash(&data, *self.public_key(), &recipients, msg_link_id);
+    ) -> Result<T, BroadcastError> {
+        let (sig, hash) = self
+            .private_key
+            .sign_init(&data, *self.public_key(), &recipients, msg_link_id)
+            .map_err(|e| BroadcastError::SigningFailed(e.to_string()))?;
         let msg = BroadcastRound::Init(data.clone(), recipients.clone(), sig);
 
         for participant in recipients.iter() {
@@ -125,37 +157,54 @@ impl<T: Data> ProtocolNode<T> {
         // Send out echo and count it
         self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
 
-        let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
+        let mut rx = self
+            .registry()
+            .subscribe(msg_link_id)
+            .await
+            .ok_or(BroadcastError::SubscriptionFailed(msg_link_id))?;
+
         self.participate_in_broadcast_inner(bcast_instance, &mut rx)
             .await
     }
 
-    pub async fn participate_in_broadcast(&self, msg_link_id: MsgLinkId) -> Result<T, String> {
-        let mut rx = self.registry().subscribe(msg_link_id).await.unwrap();
+    pub async fn participate_in_broadcast(
+        &self,
+        msg_link_id: MsgLinkId,
+    ) -> Result<T, BroadcastError> {
+        let mut rx = self
+            .registry()
+            .subscribe(msg_link_id)
+            .await
+            .ok_or(BroadcastError::SubscriptionFailed(msg_link_id))?;
+
         // wait for init message and place messages received beforehand in bcast_instance.msg_queue
-        let bcast_instance = self.wait_for_init(msg_link_id, &mut rx).await;
-        let Some(bcast_instance) = bcast_instance else {
-            return Err("Did not find init message".to_string());
-        };
+        let bcast_instance = self
+            .wait_for_init(msg_link_id, &mut rx)
+            .await
+            .ok_or(BroadcastError::InitMessageNotReceived)?;
+
         let value = self
             .participate_in_broadcast_inner(bcast_instance, &mut rx)
             .await;
         drop(rx);
         value
     }
+
     /// Participate as a recipient of a reliable broadcast
     async fn participate_in_broadcast_inner(
         &self,
         bcast_instance: BcastInstance<T>,
         rx: &mut mpsc::Receiver<MsgLink<BroadcastRound<T>>>,
-    ) -> Result<T, String> {
+    ) -> Result<T, BroadcastError> {
         let mut bcast_instance = bcast_instance;
+
         while let Some(msg) = bcast_instance.msg_queue.pop() {
             self.handle_message(msg, &mut bcast_instance).await;
             if bcast_instance.delivery_threshold_reached {
                 return Ok(bcast_instance.payload);
             }
         }
+
         while let Some(msg) = rx.recv().await {
             self.handle_message(msg, &mut bcast_instance).await;
             if bcast_instance.delivery_threshold_reached {
@@ -163,7 +212,7 @@ impl<T: Data> ProtocolNode<T> {
             }
         }
 
-        Err("Delivery threshold not met".to_string())
+        Err(BroadcastError::DeliveryThresholdNotMet)
     }
 
     /// Wait for round one message here and then go into participate_inner() with participants already set
@@ -174,24 +223,33 @@ impl<T: Data> ProtocolNode<T> {
     ) -> Option<BcastInstance<T>> {
         let mut instance_opt: Option<BcastInstance<T>> = None;
         let mut msg_queue = Vec::new();
+
         while let Some(msg) = rx.recv().await {
             let sender = msg.sender;
             if let BroadcastRound::Init(data, participants, init_sig) = msg.data {
                 // validate Initiator signature
-                let Ok(hash) = verify_init(&init_sig, &data, sender, &participants, msg_link_id)
-                else {
-                    eprintln!("invalid signature");
-                    continue;
-                };
-                let mut bcast_instance = BcastInstance::new(data, hash, participants);
-                // Send out echo and count
-                self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
-                instance_opt = Some(bcast_instance);
-                break;
+                match verify_init(&init_sig, &data, sender, &participants, msg_link_id) {
+                    Ok(hash) => {
+                        let mut bcast_instance = BcastInstance::new(data, hash, participants);
+                        // Send out echo and count
+                        self.send_echo(&mut bcast_instance, hash, msg_link_id).await;
+                        instance_opt = Some(bcast_instance);
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            sender = ?sender,
+                            msg_link_id = ?msg_link_id,
+                            "invalid init signature, ignoring message"
+                        );
+                        continue;
+                    }
+                }
             } else {
                 msg_queue.push(msg);
             }
         }
+
         if let Some(inst) = instance_opt.as_mut() {
             inst.msg_queue = msg_queue;
         }
@@ -205,30 +263,51 @@ impl<T: Data> ProtocolNode<T> {
     ) {
         let msg_link_id = msg.get_msg_id().clone();
         let sender = msg.sender;
+
         match msg.data {
             BroadcastRound::Init(_, _, _) => {
-                eprintln!("multiple init message for the same msg id");
+                tracing::warn!(
+                    msg_link_id = ?msg_link_id,
+                    "received multiple init messages for same msg_link_id, ignoring"
+                );
                 return;
             }
             BroadcastRound::Echo(init_hash, sender_sig) => {
                 // Don't run any verification logic if hash does not match initiator's message hash
                 if init_hash != bcast_instance.payload_hash {
-                    eprintln!("Received Echo containing a different hash");
+                    tracing::warn!(
+                        sender = ?sender,
+                        msg_link_id = ?msg_link_id,
+                        "received echo with mismatched hash, ignoring"
+                    );
                     return;
                 }
+
                 // Skip all counting logic if we've already sent out Ready
                 if bcast_instance.is_ready_msg_sent {
                     return;
                 }
+
                 // Ignore echo message if we've received an echo message from that pubkey
                 if bcast_instance.has_sent_echo(sender) {
-                    eprintln!("Multiple echo messages from {sender:?}");
+                    tracing::warn!(
+                        sender = ?sender,
+                        msg_link_id = ?msg_link_id,
+                        "received duplicate echo from sender, ignoring"
+                    );
                     return;
                 }
+
                 // Validate sender signature
-                if verify_echo(sender, init_hash, msg_link_id, sender_sig).is_err() {
+                if let Err(_) = verify_echo(sender, init_hash, msg_link_id, sender_sig) {
+                    tracing::warn!(
+                        sender = ?sender,
+                        msg_link_id = ?msg_link_id,
+                        "invalid echo signature, ignoring"
+                    );
                     return;
                 }
+
                 bcast_instance.count_echo(init_hash.clone(), sender).await;
                 if bcast_instance.echo_threshold_reached {
                     self.send_ready(bcast_instance, init_hash, msg_link_id)
@@ -238,18 +317,34 @@ impl<T: Data> ProtocolNode<T> {
             BroadcastRound::Ready(init_hash, signature) => {
                 // Don't run any verification logic if hash does not match initiator's message hash
                 if init_hash != bcast_instance.payload_hash {
-                    eprintln!("Received Ready containing a different hash");
+                    tracing::warn!(
+                        sender = ?sender,
+                        msg_link_id = ?msg_link_id,
+                        "received ready with mismatched hash, ignoring"
+                    );
                     return;
                 }
+
                 if bcast_instance.has_sent_ready(sender) {
-                    eprintln!("Multiple ready messages from {sender:?}");
+                    tracing::warn!(
+                        sender = ?sender,
+                        msg_link_id = ?msg_link_id,
+                        "received duplicate ready from sender, ignoring"
+                    );
                     return;
                 }
-                if verify_ready(sender, init_hash, msg_link_id, signature).is_err() {
-                    eprintln!("Invalid signature from {sender:?}");
+
+                if let Err(_) = verify_ready(sender, init_hash, msg_link_id, signature) {
+                    tracing::warn!(
+                        sender = ?sender,
+                        msg_link_id = ?msg_link_id,
+                        "invalid ready signature, ignoring"
+                    );
                     return;
                 }
+
                 bcast_instance.count_ready(init_hash.clone(), sender).await;
+
                 // Check to see if I should send out Ready amplification
                 if bcast_instance.ready_amp_threshold_reached {
                     // Dont send Ready message if already sent
@@ -370,8 +465,6 @@ pub enum BroadcastRound<T> {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SecretKey;
-
     use super::*;
     use crate::crypto::PrivateKey;
     use std::time::Duration;

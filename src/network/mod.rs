@@ -12,8 +12,10 @@ use jsonrpsee::server::ServerBuilder;
 use tokio::sync::{Mutex, mpsc, mpsc::Receiver, mpsc::Sender};
 use tower::limit::ConcurrencyLimitLayer;
 
-// How many DM messages from the network can be stored in the channel
-const MAX_MSGS_PER_LINK_ID: usize = 10000;
+const MAX_MSGS_PER_LINK_ID: usize = 1_000;
+const MAX_CONCURRENT_CONNECTIONS: usize = 1_000;
+const CHANNEL_SEND_TIMEOUT_SECS: u64 = 1;
+const RPC_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 mod api {
     use super::*;
@@ -42,10 +44,35 @@ mod api {
         async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()> {
             let msg_id = msg.msg_id;
             self.registry.register(msg_id.clone()).await;
-            self.registry.deliver(msg).await;
+
+            if let Err(e) = self.registry.deliver(msg).await {
+                tracing::warn!(
+                    msg_id = ?msg_id,
+                    error = %e,
+                    "failed to deliver message to channel"
+                );
+            }
             Ok(())
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    #[error("no active channel for msg_link_id {0:?}")]
+    NoActiveChannel(MsgLinkId),
+
+    #[error("channel send failed: {0}")]
+    ChannelSendError(String),
+
+    #[error("recipient address not found for {0:?}")]
+    RecipientNotFound(PublicKeyBytes),
+
+    #[error("RPC call failed: {0}")]
+    RpcError(String),
+
+    #[error("server builder failed: {0}")]
+    ServerBuildError(String),
 }
 
 /// Allows to have an arbitrary amount of Types of messages.
@@ -80,26 +107,26 @@ impl<T> Registry<T> {
     pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink<T>>> {
         let mut inner = self.msg_channel_map.lock().await;
         let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(16);
+            let (tx, rx) = mpsc::channel(MAX_MSGS_PER_LINK_ID);
             (tx, Some(rx))
         });
         rx.take()
     }
 
-    pub async fn deliver(&self, msg: MsgLink<T>) -> Result<(), String> {
-        let Some(tx) = self
+    pub async fn deliver(&self, msg: MsgLink<T>) -> Result<(), NetworkError> {
+        let msg_id = *msg.get_msg_id();
+
+        let tx = self
             .msg_channel_map
             .lock()
             .await
-            .get(msg.get_msg_id())
+            .get(&msg_id)
             .map(|(tx, _)| tx.clone())
-        else {
-            return Err(format!("no active channel for {:?}", msg.get_msg_id()));
-        };
-        return tx
-            .send_timeout(msg, Duration::from_secs(1))
+            .ok_or(NetworkError::NoActiveChannel(msg_id))?;
+
+        tx.send_timeout(msg, Duration::from_secs(CHANNEL_SEND_TIMEOUT_SECS))
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| NetworkError::ChannelSendError(e.to_string()))
     }
 }
 
@@ -181,12 +208,14 @@ impl<T: Data> Interface<T> {
     pub async fn new(addr: impl ToSocketAddrs) -> Arc<Self> {
         let server = ServerBuilder::default()
             .set_http_middleware(
-                tower::ServiceBuilder::new().layer(ConcurrencyLimitLayer::new(1000)),
+                tower::ServiceBuilder::new()
+                    .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_CONNECTIONS)),
             )
             .build(addr)
             .await
-            .unwrap();
-        let addr = server.local_addr().unwrap();
+            .expect("failed to build server");
+
+        let addr = server.local_addr().expect("failed to get local addr");
         let registry = Registry::new();
 
         let iface = Arc::new(Interface {
@@ -211,17 +240,59 @@ impl<T: Data> Interface<T> {
         sender: PublicKeyBytes,
     ) {
         let addr_book = self.addr_book.lock().await;
-        let rcvr_addr = addr_book.get(rcvr).unwrap();
+        let Some(rcvr_addr) = addr_book.get(rcvr) else {
+            tracing::warn!(
+                recipient = ?rcvr,
+                msg_link_id = ?msg_link_id,
+                "recipient address not found in address book, skipping send"
+            );
+            return;
+        };
+
         let client = self.connect(rcvr_addr).await;
         let msg_link = MsgLink::new(sender, msg_link_id, msg_data.to_owned());
-        client.msg(msg_link).await.unwrap();
+
+        match tokio::time::timeout(
+            Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS),
+            client.msg(msg_link),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                tracing::trace!(
+                    recipient = ?rcvr,
+                    msg_link_id = ?msg_link_id,
+                    "message sent successfully"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    recipient = ?rcvr,
+                    msg_link_id = ?msg_link_id,
+                    error = %e,
+                    "RPC call failed"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    recipient = ?rcvr,
+                    msg_link_id = ?msg_link_id,
+                    "RPC call timed out after {} seconds",
+                    RPC_REQUEST_TIMEOUT_SECS
+                );
+            }
+        }
     }
 
     pub async fn connect(&self, addr: &SocketAddr) -> Arc<HttpClient> {
         let mut clients = self.clients.lock().await;
         let client = clients.entry(*addr).or_insert_with(|| {
             let server_url = format!("http://{}", addr);
-            Arc::new(HttpClientBuilder::default().build(&server_url).unwrap())
+            Arc::new(
+                HttpClientBuilder::default()
+                    .build(&server_url)
+                    .expect("failed to build HTTP client"),
+            )
         });
         client.clone()
     }
