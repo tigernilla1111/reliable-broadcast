@@ -65,17 +65,6 @@ impl<T: Data> ProtocolNode<T> {
         self.interface.add_addr(pubkey, addr).await;
     }
 
-    // fn sign_and_hash<S: serde::Serialize>(
-    //     &self,
-    //     data: &S,
-    //     initiator: PublicKeyBytes,
-    //     participants: &Vec<PublicKeyBytes>,
-    //     msg_link_id: MsgLinkId,
-    // ) -> (SignatureBytes, HashBytes) {
-    //     self.private_key
-    //         .sign_init(data, initiator, participants, msg_link_id)
-    // }
-
     async fn send_echo(
         &self,
         bcast_instance: &mut BcastInstance<T>,
