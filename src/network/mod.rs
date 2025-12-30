@@ -301,3 +301,100 @@ impl<T: Data> Interface<T> {
         self.addr_book.lock().await.insert(pubkey, addr);
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+    struct TestData {
+        value: String,
+    }
+
+    #[tokio::test]
+    async fn test_registry_subscribe_and_deliver() {
+        // Test that messages can be delivered to subscribers
+        let registry = Registry::<TestData>::new();
+        let msg_link_id = MsgLinkId::new(1);
+        let sender = PublicKeyBytes([1u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
+
+        // Subscribe to messages for this link ID
+        let mut receiver = registry
+            .subscribe(msg_link_id)
+            .await
+            .expect("should get receiver");
+
+        // Deliver a message
+        let test_data = TestData {
+            value: "test".to_string(),
+        };
+        let test_msg = MsgLink::new(sender, msg_link_id, test_data.clone());
+
+        registry
+            .deliver(test_msg)
+            .await
+            .expect("deliver should succeed");
+
+        // Receive the message
+        let received = receiver.recv().await.expect("should receive message");
+        assert_eq!(received.data, test_data);
+        assert_eq!(received.sender, sender);
+    }
+
+    #[tokio::test]
+    async fn test_registry_subscribe_only_once() {
+        // Test that subscribe can only be called once per msg_link_id
+        let registry = Registry::<TestData>::new();
+        let msg_link_id = MsgLinkId::new(2);
+
+        // First subscribe should work
+        let first_rx = registry.subscribe(msg_link_id).await;
+        assert!(first_rx.is_some());
+
+        // Second subscribe should return None (receiver already taken)
+        let second_rx = registry.subscribe(msg_link_id).await;
+        assert!(second_rx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_interface_send_and_receive_roundtrip() {
+        // Test complete message send/receive between two interfaces
+        let interface1 = Interface::<TestData>::new("127.0.0.1:0").await;
+        let interface2 = Interface::<TestData>::new("127.0.0.1:0").await;
+
+        let key1 = PublicKeyBytes([1u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
+        let key2 = PublicKeyBytes([2u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
+
+        // Add addresses to each other's address books
+        interface1.add_addr(key2, interface2.addr).await;
+        interface2.add_addr(key1, interface1.addr).await;
+
+        let msg_link_id = MsgLinkId::new(100);
+
+        // Interface2 subscribes to messages
+        let mut receiver = interface2
+            .registry
+            .subscribe(msg_link_id)
+            .await
+            .expect("should get receiver");
+
+        // Interface1 sends a message to interface2
+        let test_data = TestData {
+            value: "hello".to_string(),
+        };
+        interface1
+            .send_msg(&key2, &test_data, msg_link_id, key1)
+            .await;
+
+        // Wait a bit for async message delivery
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Interface2 should receive the message
+        let received = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("should not timeout")
+            .expect("should receive message");
+
+        assert_eq!(received.data.value, "hello");
+        assert_eq!(received.sender, key1);
+    }
+}

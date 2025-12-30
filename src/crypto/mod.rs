@@ -33,7 +33,7 @@ impl SignatureBytes {
     }
 }
 #[derive(serde::Deserialize, serde::Serialize, PartialEq, Eq, Hash, Clone, Copy, Debug)]
-pub struct PublicKeyBytes([u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
+pub struct PublicKeyBytes(pub [u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
 impl PublicKeyBytes {
     fn to_verifying_key(self) -> Result<ed25519_dalek::VerifyingKey, CryptoError> {
         ed25519_dalek::VerifyingKey::from_bytes(&self.0)
@@ -177,4 +177,97 @@ fn init_msg_hasher<T: serde::Serialize>(
     }
     h.update(msg_link_id.to_be_bytes());
     Ok(h)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sign_and_verify_init_roundtrip() {
+        // Test the complete sign/verify cycle for init messages
+        let private_key = PrivateKey::new();
+        let initiator = private_key.public_key();
+        let participant1 = PrivateKey::new().public_key();
+        let participant2 = PrivateKey::new().public_key();
+        let participants = vec![participant1, participant2];
+        let msg_link_id = MsgLinkId::new(12345);
+
+        let test_data = "test message data";
+
+        // Sign the init message
+        let (signature, hash) = private_key
+            .sign_init(&test_data, initiator, &participants, msg_link_id)
+            .expect("signing should succeed");
+
+        // Verify the init message
+        let verified_hash = verify_init(
+            &signature,
+            &test_data,
+            initiator,
+            &participants,
+            msg_link_id,
+        )
+        .expect("verification should succeed");
+
+        // Hash from signing and verification should match
+        assert_eq!(hash, verified_hash);
+    }
+
+    #[test]
+    fn test_echo_and_ready_signature_verification() {
+        // Test that echo and ready messages are signed/verified correctly
+        let private_key = PrivateKey::new();
+        let sender = private_key.public_key();
+        let msg_link_id = MsgLinkId::new(67890);
+
+        // Create a mock hash
+        let init_hash = HashBytes([42u8; SHA512_OUTPUT_BYTES]);
+
+        // Test ECHO
+        let echo_sig = private_key.sign_echo(init_hash, msg_link_id);
+        verify_echo(sender, init_hash, msg_link_id, echo_sig)
+            .expect("echo verification should succeed");
+
+        // Test READY
+        let ready_sig = private_key.sign_ready(init_hash, msg_link_id);
+        verify_ready(sender, init_hash, msg_link_id, ready_sig)
+            .expect("ready verification should succeed");
+    }
+
+    #[test]
+    fn test_signature_verification_fails_with_wrong_key() {
+        // Test that signatures fail verification when wrong public key is used
+        let signer = PrivateKey::new();
+        let wrong_key = PrivateKey::new().public_key();
+        let correct_key = signer.public_key();
+        let msg_link_id = MsgLinkId::new(11111);
+
+        let test_data = "important data";
+        let participants = vec![correct_key];
+
+        // Sign with one key
+        let (signature, _) = signer
+            .sign_init(&test_data, correct_key, &participants, msg_link_id)
+            .expect("signing should succeed");
+
+        // Try to verify with wrong initiator key - should fail
+        let result = verify_init(
+            &signature,
+            &test_data,
+            wrong_key,
+            &participants,
+            msg_link_id,
+        );
+        assert!(matches!(result, Err(CryptoError::InvalidSignature(_))));
+
+        // Verify with correct key should succeed
+        let result = verify_init(
+            &signature,
+            &test_data,
+            correct_key,
+            &participants,
+            msg_link_id,
+        );
+        assert!(result.is_ok());
+    }
 }
