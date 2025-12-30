@@ -1,55 +1,28 @@
-# Bracha's Reliable Broadcast
+# Bracha Reliable Broadcast (Rust)
 
-A Rust implementation of Bracha's Byzantine fault-tolerant broadcast protocol for distributed systems.
+A Rust implementation of **Bracha’s Byzantine Fault-Tolerant Reliable Broadcast** protocol.
 
-## What it does
+This library allows a node to reliably broadcast a message to a set of participants such that all honest nodes either deliver the same message or deliver nothing — even in the presence of Byzantine faults.
 
-This library lets nodes in a distributed network reliably broadcast messages to each other, even when some nodes might be malicious or faulty. When one node broadcasts a message, all honest nodes are guaranteed to either deliver the same message or deliver nothing at all.
+## Protocol
 
-## Protocol overview
+The protocol proceeds in three phases:
 
-The broadcast works in three phases:
-1. **Init** - The initiator sends the message to all participants
-2. **Echo** - Recipients echo the message hash after verifying the initiator's signature
-3. **Ready** - Once enough echoes are collected, nodes broadcast ready messages and deliver when enough readys arrive
+1. **INIT** — The initiator broadcasts the signed message
+2. **ECHO** — Nodes echo the message hash after verification
+3. **READY** — Nodes broadcast readiness once quorum thresholds are met
 
-The protocol tolerates up to `t = (n-1)/3` Byzantine faults, where `n` is the total number of participants.
+The protocol tolerates up to `t = ⌊(n-1)/3⌋` Byzantine faults.
 
-## Key components
+## Properties
 
-- **ProtocolNode** - Main interface for participating in broadcasts
-- **BroadcastRound** - Message types (Init, Echo, Ready) with cryptographic signatures
-- **Interface/Registry** - Network layer handling message routing and delivery
-- **Crypto** - Ed25519 signatures with SHA-512 hashing for message integrity
+- **Validity** — Honest broadcasts are eventually delivered
+- **Agreement** — No two honest nodes deliver different values
+- **Integrity** — All messages are signed and verified
 
-## Important constraints
+## Implementation notes
 
-- **Data types must be ordered** - Use `Vec` or `BTreeMap` instead of `HashMap`/`HashSet` for broadcast payloads. The signing/verification requires deterministic serialization.
-- **SHA-512 requirement** - When using `ed25519_dalek` for prehashed signatures, the digest must be SHA-512 (per the Ed25519 specification).
-
-## Example usage
-```rust
-// Create nodes
-let node0 = ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
-let node1 = ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
-
-// Set up address books
-node0.add_addr(*node1.public_key(), node1.addr()).await;
-node1.add_addr(*node0.public_key(), node0.addr()).await;
-
-// Node 0 initiates broadcast
-let msg_id = MsgLinkId::new(100);
-let data = "Hello, world!".to_string();
-let participants = vec![*node0.public_key(), *node1.public_key()];
-
-let result = node0.broadcast_init(participants, data, msg_id).await;
-
-// Node 1 participates
-let result = node1.participate_in_broadcast(msg_id).await;
-```
-
-## Safety guarantees
-
-- **Validity** - If an honest node broadcasts a message, all honest nodes eventually deliver it
-- **Agreement** - If one honest node delivers a message, all honest nodes deliver the same message
-- **Integrity** - Messages are cryptographically signed and verified at each step
+- Uses **Ed25519 + SHA-512** signatures
+- Deterministic serialization required for MsgLink.data (`Vec`, `BTreeMap`)
+- Async Rust with Tokio
+- Transport-agnostic (currently HTTP)
