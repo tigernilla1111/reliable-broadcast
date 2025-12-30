@@ -9,6 +9,7 @@ use thiserror;
 
 const MAX_ENCODING_BYTES: usize = 10000;
 const SHA512_OUTPUT_BYTES: usize = 64;
+
 #[derive(thiserror::Error, Debug)]
 pub enum CryptoError {
     #[error("invalid signature from {0:?}")]
@@ -32,12 +33,57 @@ impl SignatureBytes {
         ed25519_dalek::Signature::from_bytes(&self.0)
     }
 }
+
 #[derive(serde::Deserialize, serde::Serialize, PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub struct PublicKeyBytes(pub [u8; ed25519_dalek::PUBLIC_KEY_LENGTH]);
+
 impl PublicKeyBytes {
     fn to_verifying_key(self) -> Result<ed25519_dalek::VerifyingKey, CryptoError> {
         ed25519_dalek::VerifyingKey::from_bytes(&self.0)
             .map_err(|_| CryptoError::InvalidPublicKey(self))
+    }
+}
+
+pub struct PrivateKey(ed25519_dalek::SigningKey);
+
+impl PrivateKey {
+    pub fn new() -> Self {
+        let mut rng = OsRng;
+        Self(ed25519_dalek::SigningKey::generate(&mut rng))
+    }
+
+    pub fn public_key(&self) -> PublicKeyBytes {
+        PublicKeyBytes(self.0.verifying_key().to_bytes())
+    }
+
+    pub fn sign_init<T: serde::Serialize>(
+        &self,
+        data: &T,
+        initiator: PublicKeyBytes,
+        participants: &[PublicKeyBytes],
+        msg_link_id: MsgLinkId,
+    ) -> Result<(SignatureBytes, HashBytes), CryptoError> {
+        let hasher = init_msg_hasher(data, initiator, participants, msg_link_id)?;
+
+        let sig = self
+            .0
+            .sign_prehashed(hasher.clone(), None)
+            .map_err(|_| CryptoError::Serialization)?;
+
+        Ok((
+            SignatureBytes(sig.to_bytes()),
+            HashBytes(hasher.finalize().into()),
+        ))
+    }
+
+    pub fn sign_echo(&self, hash: HashBytes, msg_link_id: MsgLinkId) -> SignatureBytes {
+        let bytes = canonical_echo_bytes(self.public_key(), hash, msg_link_id);
+        SignatureBytes(self.0.sign(&bytes).to_bytes())
+    }
+
+    pub fn sign_ready(&self, hash: HashBytes, msg_link_id: MsgLinkId) -> SignatureBytes {
+        let bytes = canonical_ready_bytes(self.public_key(), hash, msg_link_id);
+        SignatureBytes(self.0.sign(&bytes).to_bytes())
     }
 }
 
@@ -84,48 +130,6 @@ pub fn verify_ready(
         .to_verifying_key()?
         .verify(&bytes, &sig.to_signature())
         .map_err(|_| CryptoError::InvalidSignature(sender))
-}
-
-pub struct PrivateKey(ed25519_dalek::SigningKey);
-impl PrivateKey {
-    pub fn new() -> Self {
-        let mut rng = OsRng;
-        Self(ed25519_dalek::SigningKey::generate(&mut rng))
-    }
-
-    pub fn public_key(&self) -> PublicKeyBytes {
-        PublicKeyBytes(self.0.verifying_key().to_bytes())
-    }
-
-    pub fn sign_init<T: serde::Serialize>(
-        &self,
-        data: &T,
-        initiator: PublicKeyBytes,
-        participants: &[PublicKeyBytes],
-        msg_link_id: MsgLinkId,
-    ) -> Result<(SignatureBytes, HashBytes), CryptoError> {
-        let hasher = init_msg_hasher(data, initiator, participants, msg_link_id)?;
-
-        let sig = self
-            .0
-            .sign_prehashed(hasher.clone(), None)
-            .map_err(|_| CryptoError::Serialization)?;
-
-        Ok((
-            SignatureBytes(sig.to_bytes()),
-            HashBytes(hasher.finalize().into()),
-        ))
-    }
-
-    pub fn sign_echo(&self, hash: HashBytes, msg_link_id: MsgLinkId) -> SignatureBytes {
-        let bytes = canonical_echo_bytes(self.public_key(), hash, msg_link_id);
-        SignatureBytes(self.0.sign(&bytes).to_bytes())
-    }
-
-    pub fn sign_ready(&self, hash: HashBytes, msg_link_id: MsgLinkId) -> SignatureBytes {
-        let bytes = canonical_ready_bytes(self.public_key(), hash, msg_link_id);
-        SignatureBytes(self.0.sign(&bytes).to_bytes())
-    }
 }
 
 fn canonical_echo_bytes(
@@ -178,6 +182,7 @@ fn init_msg_hasher<T: serde::Serialize>(
     h.update(msg_link_id.to_be_bytes());
     Ok(h)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,46 +17,6 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1_000;
 const CHANNEL_SEND_TIMEOUT_SECS: u64 = 1;
 const RPC_REQUEST_TIMEOUT_SECS: u64 = 5;
 
-mod api {
-    use super::*;
-
-    #[rpc(server, client)]
-    pub trait MyRpc<T> {
-        #[method(name = "msg")]
-        async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()>;
-    }
-
-    pub struct MsgLinkServer<T> {
-        registry: Registry<T>,
-    }
-
-    impl<T> MsgLinkServer<T> {
-        pub fn new(registry: Registry<T>) -> Self {
-            MsgLinkServer { registry }
-        }
-    }
-
-    #[async_trait]
-    impl<T> MyRpcServer<T> for MsgLinkServer<T>
-    where
-        T: Send + 'static,
-    {
-        async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()> {
-            let msg_id = msg.msg_id;
-            self.registry.register(msg_id.clone()).await;
-
-            if let Err(e) = self.registry.deliver(msg).await {
-                tracing::warn!(
-                    msg_id = ?msg_id,
-                    error = %e,
-                    "failed to deliver message to channel"
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {
     #[error("no active channel for msg_link_id {0:?}")]
@@ -74,63 +34,6 @@ pub enum NetworkError {
     #[error("server builder failed: {0}")]
     ServerBuildError(String),
 }
-
-/// Allows to have an arbitrary amount of Types of messages.
-type InnerRegistry<T> = HashMap<MsgLinkId, (Sender<MsgLink<T>>, Option<Receiver<MsgLink<T>>>)>;
-
-#[derive(Clone)]
-pub struct Registry<T> {
-    msg_channel_map: Arc<Mutex<InnerRegistry<T>>>,
-}
-
-impl<T> Registry<T> {
-    pub fn new() -> Self {
-        Self {
-            msg_channel_map: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    // If receiving messages for a MsgLinkId that hasnt been registered yet, it will store sender and receiver
-    // If initiating a MsgLinkId, the rcvr will be returned automatically
-    pub async fn register(&self, msg_id: MsgLinkId) {
-        self.msg_channel_map
-            .lock()
-            .await
-            .entry(msg_id)
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(MAX_MSGS_PER_LINK_ID);
-                (tx, Some(rx))
-            });
-    }
-
-    // Return and empty the stored rx channel. Note: this can only be done once
-    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink<T>>> {
-        let mut inner = self.msg_channel_map.lock().await;
-        let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(MAX_MSGS_PER_LINK_ID);
-            (tx, Some(rx))
-        });
-        rx.take()
-    }
-
-    pub async fn deliver(&self, msg: MsgLink<T>) -> Result<(), NetworkError> {
-        let msg_id = *msg.get_msg_id();
-
-        let tx = self
-            .msg_channel_map
-            .lock()
-            .await
-            .get(&msg_id)
-            .map(|(tx, _)| tx.clone())
-            .ok_or(NetworkError::NoActiveChannel(msg_id))?;
-
-        tx.send_timeout(msg, Duration::from_secs(CHANNEL_SEND_TIMEOUT_SECS))
-            .await
-            .map_err(|e| NetworkError::ChannelSendError(e.to_string()))
-    }
-}
-
-use api::{MsgLinkServer, MyRpcClient, MyRpcServer};
 
 pub trait Data:
     Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Clone + std::fmt::Debug + 'static
@@ -189,9 +92,58 @@ impl std::ops::Deref for MsgLinkId {
     }
 }
 
-pub fn create_msg_link_rpc_module<T: Data>(registry: Registry<T>) -> jsonrpsee::RpcModule<()> {
-    let server_impl = MsgLinkServer::new(registry);
-    server_impl.into_rpc().remove_context()
+type InnerRegistry<T> = HashMap<MsgLinkId, (Sender<MsgLink<T>>, Option<Receiver<MsgLink<T>>>)>;
+
+#[derive(Clone)]
+pub struct Registry<T> {
+    msg_channel_map: Arc<Mutex<InnerRegistry<T>>>,
+}
+
+impl<T> Registry<T> {
+    pub fn new() -> Self {
+        Self {
+            msg_channel_map: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    // If receiving messages for a MsgLinkId that hasnt been registered yet, it will store sender and receiver
+    // If initiating a MsgLinkId, the rcvr will be returned automatically
+    pub async fn register(&self, msg_id: MsgLinkId) {
+        self.msg_channel_map
+            .lock()
+            .await
+            .entry(msg_id)
+            .or_insert_with(|| {
+                let (tx, rx) = mpsc::channel(MAX_MSGS_PER_LINK_ID);
+                (tx, Some(rx))
+            });
+    }
+
+    // Return and empty the stored rx channel. Note: this can only be done once
+    pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink<T>>> {
+        let mut inner = self.msg_channel_map.lock().await;
+        let (_, rx) = inner.entry(msg_id).or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(MAX_MSGS_PER_LINK_ID);
+            (tx, Some(rx))
+        });
+        rx.take()
+    }
+
+    pub async fn deliver(&self, msg: MsgLink<T>) -> Result<(), NetworkError> {
+        let msg_id = *msg.get_msg_id();
+
+        let tx = self
+            .msg_channel_map
+            .lock()
+            .await
+            .get(&msg_id)
+            .map(|(tx, _)| tx.clone())
+            .ok_or(NetworkError::NoActiveChannel(msg_id))?;
+
+        tx.send_timeout(msg, Duration::from_secs(CHANNEL_SEND_TIMEOUT_SECS))
+            .await
+            .map_err(|e| NetworkError::ChannelSendError(e.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -229,6 +181,10 @@ impl<T: Data> Interface<T> {
         tokio::spawn(server_handle.stopped());
 
         iface
+    }
+
+    pub async fn add_addr(&self, pubkey: PublicKeyBytes, addr: SocketAddr) {
+        self.addr_book.lock().await.insert(pubkey, addr);
     }
 
     /// Registers the msg_link_id in the registry before sending
@@ -296,11 +252,55 @@ impl<T: Data> Interface<T> {
         });
         client.clone()
     }
+}
 
-    pub async fn add_addr(&self, pubkey: PublicKeyBytes, addr: SocketAddr) {
-        self.addr_book.lock().await.insert(pubkey, addr);
+mod api {
+    use super::*;
+
+    #[rpc(server, client)]
+    pub trait MyRpc<T> {
+        #[method(name = "msg")]
+        async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()>;
+    }
+
+    pub struct MsgLinkServer<T> {
+        registry: Registry<T>,
+    }
+
+    impl<T> MsgLinkServer<T> {
+        pub fn new(registry: Registry<T>) -> Self {
+            MsgLinkServer { registry }
+        }
+    }
+
+    #[async_trait]
+    impl<T> MyRpcServer<T> for MsgLinkServer<T>
+    where
+        T: Send + 'static,
+    {
+        async fn msg(&self, msg: MsgLink<T>) -> RpcResult<()> {
+            let msg_id = msg.msg_id;
+            self.registry.register(msg_id.clone()).await;
+
+            if let Err(e) = self.registry.deliver(msg).await {
+                tracing::warn!(
+                    msg_id = ?msg_id,
+                    error = %e,
+                    "failed to deliver message to channel"
+                );
+            }
+            Ok(())
+        }
     }
 }
+
+use api::{MsgLinkServer, MyRpcClient, MyRpcServer};
+
+pub fn create_msg_link_rpc_module<T: Data>(registry: Registry<T>) -> jsonrpsee::RpcModule<()> {
+    let server_impl = MsgLinkServer::new(registry);
+    server_impl.into_rpc().remove_context()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
