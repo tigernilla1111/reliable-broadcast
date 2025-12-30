@@ -48,7 +48,7 @@ pub fn verify_init<T: serde::Serialize>(
     participants: &[PublicKeyBytes],
     msg_link_id: MsgLinkId,
 ) -> Result<HashBytes, CryptoError> {
-    let hasher = init_msg_hasher(data, initiator, participants, msg_link_id);
+    let hasher = init_msg_hasher(data, initiator, participants, msg_link_id)?;
 
     let pubkey = initiator.to_verifying_key()?;
     pubkey
@@ -104,7 +104,7 @@ impl PrivateKey {
         participants: &[PublicKeyBytes],
         msg_link_id: MsgLinkId,
     ) -> Result<(SignatureBytes, HashBytes), CryptoError> {
-        let hasher = init_msg_hasher(data, initiator, participants, msg_link_id);
+        let hasher = init_msg_hasher(data, initiator, participants, msg_link_id)?;
 
         let sig = self
             .0
@@ -168,25 +168,13 @@ fn init_msg_hasher<T: serde::Serialize>(
     initiator: PublicKeyBytes,
     participants: &[PublicKeyBytes],
     msg_link_id: MsgLinkId,
-) -> Sha512 {
+) -> Result<Sha512, CryptoError> {
     let mut h = Sha512::new();
-    if let Ok(bytes) = canonical_bytes(data) {
-        h.update(bytes);
-    }
+    h.update(canonical_bytes(data)?);
     h.update(initiator.0);
     for p in participants {
         h.update(p.0);
     }
     h.update(msg_link_id.to_be_bytes());
-    h
-}
-
-pub fn init_msg_hash<T: serde::Serialize>(
-    data: &T,
-    initiator: PublicKeyBytes,
-    participants: &[PublicKeyBytes],
-    msg_link_id: MsgLinkId,
-) -> Result<HashBytes, CryptoError> {
-    let h = init_msg_hasher(data, initiator, participants, msg_link_id);
-    Ok(HashBytes(h.finalize().into()))
+    Ok(h)
 }
