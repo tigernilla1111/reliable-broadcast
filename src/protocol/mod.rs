@@ -720,4 +720,119 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn test_broadcast_with_byzantine_node_sending_invalid_signatures() {
+        // Test that nodes reject messages with invalid signatures from a Byzantine node
+        // The honest nodes should still complete the broadcast successfully
+        let honest_node0: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let honest_node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let honest_node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let byzantine_node: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let pubkey0 = *honest_node0.public_key();
+        let pubkey1 = *honest_node1.public_key();
+        let pubkey2 = *honest_node2.public_key();
+        let pubkey_byz = *byzantine_node.public_key();
+
+        // Set up address books
+        for node in [&honest_node0, &honest_node1, &honest_node2, &byzantine_node] {
+            node.add_addr(pubkey0, honest_node0.addr()).await;
+            node.add_addr(pubkey1, honest_node1.addr()).await;
+            node.add_addr(pubkey2, honest_node2.addr()).await;
+            node.add_addr(pubkey_byz, byzantine_node.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(300);
+        let broadcast_data = "Broadcast with Byzantine node".to_string();
+        let participants = vec![pubkey0, pubkey1, pubkey2, pubkey_byz];
+
+        // Honest node0 initiates broadcast
+        let node0_clone = honest_node0.clone();
+        let data_clone = broadcast_data.clone();
+        let participants_clone = participants.clone();
+        let initiator_task = tokio::spawn(async move {
+            node0_clone
+                .broadcast_init(participants_clone, data_clone, msg_link_id)
+                .await
+        });
+
+        // Honest nodes participate normally
+        let node1_clone = honest_node1.clone();
+        let participant1_task =
+            tokio::spawn(async move { node1_clone.participate_in_broadcast(msg_link_id).await });
+
+        let node2_clone = honest_node2.clone();
+        let participant2_task =
+            tokio::spawn(async move { node2_clone.participate_in_broadcast(msg_link_id).await });
+
+        // Byzantine node receives Init and subscribes, but we'll manually send garbage
+        let byz_clone = byzantine_node.clone();
+        let byzantine_task = tokio::spawn(async move {
+            let mut rx = byz_clone
+                .registry()
+                .subscribe(msg_link_id)
+                .await
+                .expect("should subscribe");
+
+            // Wait for Init message
+            if let Some(msg) = rx.recv().await {
+                if let BroadcastRound::Init(data, participants, init_sig) = msg.data {
+                    let sender = msg.sender;
+                    let hash =
+                        verify_init(&init_sig, &data, sender, &participants, msg_link_id).unwrap();
+                    // Send Echo with WRONG signature (signed by different key)
+                    let wrong_key = PrivateKey::new();
+                    let bad_sig = wrong_key.sign_echo(hash, msg_link_id);
+                    let bad_echo = BroadcastRound::Echo(hash, bad_sig);
+
+                    // Send bad messages to all honest nodes
+                    for participant in participants.iter() {
+                        if participant == byz_clone.public_key() {
+                            continue;
+                        }
+                        byz_clone
+                            .interface
+                            .send_msg(participant, &bad_echo, msg_link_id, *byz_clone.public_key())
+                            .await;
+                    }
+                }
+            }
+
+            // Byzantine node just waits - it won't complete the protocol
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let timeout_duration = Duration::from_secs(4);
+
+        // All honest nodes should complete successfully despite Byzantine interference
+        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+            .await
+            .expect("Node 0 timed out")
+            .expect("Node 0 panicked")
+            .expect("Node 0 broadcast failed");
+
+        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
+            .await
+            .expect("Node 1 timed out")
+            .expect("Node 1 panicked")
+            .expect("Node 1 broadcast failed");
+
+        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
+            .await
+            .expect("Node 2 timed out")
+            .expect("Node 2 panicked")
+            .expect("Node 2 broadcast failed");
+
+        // Verify all honest nodes got the correct data
+        assert_eq!(result0, broadcast_data);
+        assert_eq!(result1, broadcast_data);
+        assert_eq!(result2, broadcast_data);
+
+        // Byzantine task should still be running (it won't complete)
+        drop(byzantine_task);
+    }
 }
