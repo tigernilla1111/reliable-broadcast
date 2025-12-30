@@ -14,6 +14,13 @@ The protocol proceeds in three phases:
 
 The protocol tolerates up to `t = ⌊(n-1)/3⌋` Byzantine faults.
 
+## References
+
+This implementation is based on **Bracha’s Reliable Broadcast**:
+
+- Gabriel Bracha, *An Asynchronous [(n−1)/3]-Resilient Consensus Protocol*, INRIA  
+  https://inria.hal.science/hal-03347874v1/document
+  
 ## Properties
 
 - **Validity** — Honest broadcasts are eventually delivered

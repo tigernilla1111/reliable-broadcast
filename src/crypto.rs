@@ -4,7 +4,7 @@ use ed25519_dalek::Verifier;
 use ed25519_dalek::ed25519::signature::Signer;
 use rand_core::OsRng;
 use serde_bytes;
-use sha2::{Digest, Sha512, digest::OutputSizeUser};
+use sha2::{Digest, Sha512};
 use thiserror;
 
 const MAX_ENCODING_BYTES: usize = 10000;
