@@ -2,7 +2,7 @@
 
 A Rust implementation of **Bracha’s Byzantine Fault-Tolerant Reliable Broadcast** protocol.
 
-This library allows a node to reliably broadcast a message to a set of participants such that all honest nodes either deliver the same message or deliver nothing — even in the presence of Byzantine faults.
+This library allows a node to reliably broadcast a message to a set of participants such that all honest nodes either deliver the same message or deliver nothing, even in the presence of Byzantine faults.
 
 ## Protocol
 
