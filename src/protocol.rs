@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -184,6 +185,7 @@ impl<T: Data> ProtocolNode<T> {
         recipients: Vec<PublicKeyBytes>,
         data: T,
         msg_link_id: MsgLinkId,
+        timeout_secs: u64,
     ) -> Result<T, BroadcastError> {
         let (sig, hash) = self
             .private_key
@@ -211,14 +213,23 @@ impl<T: Data> ProtocolNode<T> {
             .await
             .ok_or(BroadcastError::SubscriptionFailed(msg_link_id))?;
 
-        self.participate_in_broadcast_inner(bcast_instance, &mut rx)
-            .await
+        let res = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            self.participate_in_broadcast_inner(bcast_instance, &mut rx),
+        )
+        .await
+        .map_err(|_| BroadcastError::Timeout(timeout_secs))?;
+
+        drop(rx);
+
+        res
     }
 
     /// Participate as a recipient of a reliable broadcast
     pub async fn participate_in_broadcast(
         &self,
         msg_link_id: MsgLinkId,
+        timeout_secs: u64,
     ) -> Result<T, BroadcastError> {
         let mut rx = self
             .registry()
@@ -226,16 +237,20 @@ impl<T: Data> ProtocolNode<T> {
             .await
             .ok_or(BroadcastError::SubscriptionFailed(msg_link_id))?;
 
-        let bcast_instance = self
-            .wait_for_init(msg_link_id, &mut rx)
-            .await
-            .ok_or(BroadcastError::InitMessageNotReceived)?;
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            let bcast_instance = self
+                .wait_for_init(msg_link_id, &mut rx)
+                .await
+                .ok_or(BroadcastError::InitMessageNotReceived)?;
 
-        let value = self
-            .participate_in_broadcast_inner(bcast_instance, &mut rx)
-            .await;
+            self.participate_in_broadcast_inner(bcast_instance, &mut rx)
+                .await
+        })
+        .await
+        .map_err(|_| BroadcastError::Timeout(timeout_secs))?;
+
         drop(rx);
-        value
+        result
     }
 
     async fn participate_in_broadcast_inner(
@@ -461,6 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcast_four_honest_nodes() {
+        const TIMEOUT_SECS: u64 = 5;
         let node0: Arc<ProtocolNode<String>> =
             ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
         let node1: Arc<ProtocolNode<String>> =
@@ -491,46 +507,46 @@ mod tests {
         let participants_clone = participants.clone();
         let initiator_task = tokio::spawn(async move {
             node0_clone
-                .broadcast_init(participants_clone, data_clone, msg_link_id)
+                .broadcast_init(participants_clone, data_clone, msg_link_id, TIMEOUT_SECS)
                 .await
         });
 
         let node1_clone = node1.clone();
-        let participant1_task =
-            tokio::spawn(async move { node1_clone.participate_in_broadcast(msg_link_id).await });
+        let participant1_task = tokio::spawn(async move {
+            node1_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
 
         let node2_clone = node2.clone();
-        let participant2_task =
-            tokio::spawn(async move { node2_clone.participate_in_broadcast(msg_link_id).await });
+        let participant2_task = tokio::spawn(async move {
+            node2_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
 
         let node3_clone = node3.clone();
-        let participant3_task =
-            tokio::spawn(async move { node3_clone.participate_in_broadcast(msg_link_id).await });
+        let participant3_task = tokio::spawn(async move {
+            node3_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
 
-        let timeout_duration = Duration::from_secs(3);
-
-        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+        let result0 = initiator_task
             .await
-            .expect("Node 0 timed out")
-            .expect("Node 0 task panicked")
+            .expect("Node 0 panicked")
             .expect("Node 0 broadcast failed");
-
-        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
+        let result1 = participant1_task
             .await
-            .expect("Node 1 timed out")
-            .expect("Node 1 task panicked")
+            .expect("Node 1 panicked")
             .expect("Node 1 broadcast failed");
-
-        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
+        let result2 = participant2_task
             .await
-            .expect("Node 2 timed out")
-            .expect("Node 2 task panicked")
+            .expect("Node 2 panicked")
             .expect("Node 2 broadcast failed");
-
-        let result3 = tokio::time::timeout(timeout_duration, participant3_task)
+        let result3 = participant3_task
             .await
-            .expect("Node 3 timed out")
-            .expect("Node 3 task panicked")
+            .expect("Node 3 panicked")
             .expect("Node 3 broadcast failed");
 
         assert_eq!(result0, broadcast_data);
@@ -541,6 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcast_messages_arrive_out_of_order() {
+        const TIMEOUT_SECS: u64 = 5;
         let node0: Arc<ProtocolNode<String>> =
             ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
         let node1: Arc<ProtocolNode<String>> =
@@ -569,19 +586,25 @@ mod tests {
         let node1_clone = node1.clone();
         let participant1_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            node1_clone.participate_in_broadcast(msg_link_id).await
+            node1_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
         });
 
         let node2_clone = node2.clone();
         let participant2_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            node2_clone.participate_in_broadcast(msg_link_id).await
+            node2_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
         });
 
         let node3_clone = node3.clone();
         let participant3_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            node3_clone.participate_in_broadcast(msg_link_id).await
+            node3_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -591,33 +614,24 @@ mod tests {
         let participants_clone = participants.clone();
         let initiator_task = tokio::spawn(async move {
             node0_clone
-                .broadcast_init(participants_clone, data_clone, msg_link_id)
+                .broadcast_init(participants_clone, data_clone, msg_link_id, TIMEOUT_SECS)
                 .await
         });
 
-        let timeout_duration = Duration::from_secs(5);
-
-        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+        let result0 = initiator_task
             .await
-            .expect("Node 0 timed out")
             .expect("Node 0 panicked")
             .expect("Node 0 failed");
-
-        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
+        let result1 = participant1_task
             .await
-            .expect("Node 1 timed out")
             .expect("Node 1 panicked")
             .expect("Node 1 failed");
-
-        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
+        let result2 = participant2_task
             .await
-            .expect("Node 2 timed out")
             .expect("Node 2 panicked")
             .expect("Node 2 failed");
-
-        let result3 = tokio::time::timeout(timeout_duration, participant3_task)
+        let result3 = participant3_task
             .await
-            .expect("Node 3 timed out")
             .expect("Node 3 panicked")
             .expect("Node 3 failed");
 
@@ -630,6 +644,7 @@ mod tests {
     #[tokio::test]
     async fn test_broadcast_multiple_concurrent_broadcasts() {
         const NUM_NODES: usize = 10;
+        const TIMEOUT_SECS: u64 = 10;
 
         let mut nodes = Vec::new();
         let mut pubkeys = Vec::new();
@@ -659,7 +674,12 @@ mod tests {
             let participants_clone = participants.clone();
             let init_task = tokio::spawn(async move {
                 node_clone
-                    .broadcast_init(participants_clone, data_clone.clone(), msg_link_id)
+                    .broadcast_init(
+                        participants_clone,
+                        data_clone.clone(),
+                        msg_link_id,
+                        TIMEOUT_SECS,
+                    )
                     .await
                     .map(|result| (msg_link_id, result))
             });
@@ -673,7 +693,7 @@ mod tests {
                 let node_clone = participant_node.clone();
                 let part_task = tokio::spawn(async move {
                     node_clone
-                        .participate_in_broadcast(msg_link_id)
+                        .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
                         .await
                         .map(|result| (msg_link_id, result))
                 });
@@ -681,37 +701,25 @@ mod tests {
             }
         }
 
-        let timeout_duration = Duration::from_secs(10);
         let mut results_by_msg_id = HashMap::new();
 
         for task in all_tasks {
-            match tokio::time::timeout(timeout_duration, task).await {
-                Ok(Ok(Ok((msg_id, data)))) => {
+            match task.await {
+                Ok(Ok((msg_id, data))) => {
                     results_by_msg_id
                         .entry(msg_id)
                         .or_insert_with(Vec::new)
                         .push(data);
                 }
-                Ok(Ok(Err(e))) => panic!("Task failed: {}", e),
-                Ok(Err(e)) => panic!("Task panicked: {:?}", e),
-                Err(_) => panic!("Task timed out"),
+                Ok(Err(e)) => panic!("Task failed: {}", e),
+                Err(e) => panic!("Task panicked: {:?}", e),
             }
         }
 
-        assert_eq!(
-            results_by_msg_id.len(),
-            NUM_NODES,
-            "Should have results for all broadcasts"
-        );
+        assert_eq!(results_by_msg_id.len(), NUM_NODES);
 
         for (msg_id, results) in results_by_msg_id.iter() {
-            assert_eq!(
-                results.len(),
-                NUM_NODES,
-                "Each broadcast should reach all {} nodes",
-                NUM_NODES
-            );
-
+            assert_eq!(results.len(), NUM_NODES);
             let first = &results[0];
             assert!(
                 results.iter().all(|r| r == first),
@@ -720,10 +728,13 @@ mod tests {
             );
         }
     }
+
     #[tokio::test]
     async fn test_broadcast_with_byzantine_node_sending_invalid_signatures() {
         // Test that nodes reject messages with invalid signatures from a Byzantine node
         // The honest nodes should still complete the broadcast successfully
+
+        const TIMEOUT_SECS: u64 = 5;
         let honest_node0: Arc<ProtocolNode<String>> =
             ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
         let honest_node1: Arc<ProtocolNode<String>> =
@@ -756,18 +767,24 @@ mod tests {
         let participants_clone = participants.clone();
         let initiator_task = tokio::spawn(async move {
             node0_clone
-                .broadcast_init(participants_clone, data_clone, msg_link_id)
+                .broadcast_init(participants_clone, data_clone, msg_link_id, TIMEOUT_SECS)
                 .await
         });
 
         // Honest nodes participate normally
         let node1_clone = honest_node1.clone();
-        let participant1_task =
-            tokio::spawn(async move { node1_clone.participate_in_broadcast(msg_link_id).await });
+        let participant1_task = tokio::spawn(async move {
+            node1_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
 
         let node2_clone = honest_node2.clone();
-        let participant2_task =
-            tokio::spawn(async move { node2_clone.participate_in_broadcast(msg_link_id).await });
+        let participant2_task = tokio::spawn(async move {
+            node2_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
 
         // Byzantine node receives Init and subscribes, but we'll manually send garbage
         let byz_clone = byzantine_node.clone();
@@ -803,27 +820,20 @@ mod tests {
             }
 
             // Byzantine node just waits - it won't complete the protocol
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(TIMEOUT_SECS)).await;
         });
 
-        let timeout_duration = Duration::from_secs(4);
-
         // All honest nodes should complete successfully despite Byzantine interference
-        let result0 = tokio::time::timeout(timeout_duration, initiator_task)
+        let result0 = initiator_task
             .await
-            .expect("Node 0 timed out")
             .expect("Node 0 panicked")
             .expect("Node 0 broadcast failed");
-
-        let result1 = tokio::time::timeout(timeout_duration, participant1_task)
+        let result1 = participant1_task
             .await
-            .expect("Node 1 timed out")
             .expect("Node 1 panicked")
             .expect("Node 1 broadcast failed");
-
-        let result2 = tokio::time::timeout(timeout_duration, participant2_task)
+        let result2 = participant2_task
             .await
-            .expect("Node 2 timed out")
             .expect("Node 2 panicked")
             .expect("Node 2 broadcast failed");
 
@@ -834,5 +844,290 @@ mod tests {
 
         // Byzantine task should still be running (it won't complete)
         drop(byzantine_task);
+    }
+
+    #[tokio::test]
+    async fn test_byzantine_initiator_equivocates_to_one_node() {
+        // Byzantine initiator equivocates: sends data_a to node1 + node2, data_b to node3.
+        // This models a Byzantine node that equivocates on Init but cooperates with one partition.
+        const TIMEOUT_SECS: u64 = 3;
+        let byz_key = PrivateKey::new();
+        let byz_node: Arc<ProtocolNode<String>> = ProtocolNode::new("127.0.0.1:0", byz_key).await;
+        let node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node3: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let byz_pubkey = *byz_node.public_key();
+        let pubkey1 = *node1.public_key();
+        let pubkey2 = *node2.public_key();
+        let pubkey3 = *node3.public_key();
+
+        for node in [&byz_node, &node1, &node2, &node3] {
+            node.add_addr(byz_pubkey, byz_node.addr()).await;
+            node.add_addr(pubkey1, node1.addr()).await;
+            node.add_addr(pubkey2, node2.addr()).await;
+            node.add_addr(pubkey3, node3.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(500);
+        let data_a = "Legitimate message".to_string();
+        let data_b = "Equivocating message".to_string();
+        let participants = vec![byz_pubkey, pubkey1, pubkey2, pubkey3];
+
+        let (sig_a, hash_a) = byz_node
+            .private_key
+            .sign_init(&data_a, byz_pubkey, &participants, msg_link_id)
+            .unwrap();
+        let (sig_b, _) = byz_node
+            .private_key
+            .sign_init(&data_b, byz_pubkey, &participants, msg_link_id)
+            .unwrap();
+
+        let init_a = BroadcastRound::Init(data_a.clone(), participants.clone(), sig_a);
+        let init_b = BroadcastRound::Init(data_b.clone(), participants.clone(), sig_b);
+
+        // Send data_a to node1 + node2, data_b to node3
+        byz_node
+            .interface
+            .send_msg(&pubkey1, &init_a, msg_link_id, byz_pubkey)
+            .await;
+        byz_node
+            .interface
+            .send_msg(&pubkey2, &init_a, msg_link_id, byz_pubkey)
+            .await;
+        byz_node
+            .interface
+            .send_msg(&pubkey3, &init_b, msg_link_id, byz_pubkey)
+            .await;
+
+        // The Byzantine node explicitly sends Echo(hash_a) and Ready(hash_a) because
+        // it is operating outside the protocol loop
+        let echo_sig = byz_node.private_key.sign_echo(hash_a, msg_link_id);
+        let echo_msg = BroadcastRound::Echo(hash_a, echo_sig);
+        for pk in [&pubkey1, &pubkey2, &pubkey3] {
+            byz_node
+                .interface
+                .send_msg(pk, &echo_msg, msg_link_id, byz_pubkey)
+                .await;
+        }
+        let ready_sig = byz_node.private_key.sign_ready(hash_a, msg_link_id);
+        let ready_msg = BroadcastRound::Ready(hash_a, ready_sig);
+        for pk in [&pubkey1, &pubkey2] {
+            byz_node
+                .interface
+                .send_msg(pk, &ready_msg, msg_link_id, byz_pubkey)
+                .await;
+        }
+
+        let node1_clone = node1.clone();
+        let t1 = tokio::spawn(async move {
+            node1_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+
+        let node2_clone = node2.clone();
+        let t2 = tokio::spawn(async move {
+            node2_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+
+        let node3_clone = node3.clone();
+        let t3 = tokio::spawn(async move {
+            node3_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+
+        // node1 and node2 deliver data_a successfully
+        let result1 = t1.await.unwrap().expect("node1 should deliver");
+        let result2 = t2.await.unwrap().expect("node2 should deliver");
+        assert_eq!(result1, data_a);
+        assert_eq!(result2, data_a);
+
+        // node3 received data_b but never reaches echo threshold — it should time out
+        let result3 = t3.await.unwrap();
+        assert!(
+            matches!(result3, Err(BroadcastError::Timeout(TIMEOUT_SECS))),
+            "node3 should time out waiting on stalled hash_b, got {:?}",
+            result3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_byzantine_initiator_equivocates_to_majority() {
+        // Byzantine initiator equivocates: sends data_a to node1 only, data_b to node2 + node3.
+        // No node reaches echo threshold so no Ready messages are ever sent.
+        // All honest nodes stall and return Timeout.
+        const TIMEOUT_SECS: u64 = 1;
+        let byz_key = PrivateKey::new();
+        let byz_node: Arc<ProtocolNode<String>> = ProtocolNode::new("127.0.0.1:0", byz_key).await;
+        let node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node3: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let byz_pubkey = *byz_node.public_key();
+        let pubkey1 = *node1.public_key();
+        let pubkey2 = *node2.public_key();
+        let pubkey3 = *node3.public_key();
+
+        for node in [&byz_node, &node1, &node2, &node3] {
+            node.add_addr(byz_pubkey, byz_node.addr()).await;
+            node.add_addr(pubkey1, node1.addr()).await;
+            node.add_addr(pubkey2, node2.addr()).await;
+            node.add_addr(pubkey3, node3.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(600);
+        let data_a = "Message A".to_string();
+        let data_b = "Message B".to_string();
+        let participants = vec![byz_pubkey, pubkey1, pubkey2, pubkey3];
+
+        let (sig_a, hash_a) = byz_node
+            .private_key
+            .sign_init(&data_a, byz_pubkey, &participants, msg_link_id)
+            .unwrap();
+        let (sig_b, _) = byz_node
+            .private_key
+            .sign_init(&data_b, byz_pubkey, &participants, msg_link_id)
+            .unwrap();
+
+        let init_a = BroadcastRound::Init(data_a.clone(), participants.clone(), sig_a);
+        let init_b = BroadcastRound::Init(data_b.clone(), participants.clone(), sig_b);
+
+        // Send data_a to node1 only, data_b to node2 and node3
+        byz_node
+            .interface
+            .send_msg(&pubkey1, &init_a, msg_link_id, byz_pubkey)
+            .await;
+        byz_node
+            .interface
+            .send_msg(&pubkey2, &init_b, msg_link_id, byz_pubkey)
+            .await;
+        byz_node
+            .interface
+            .send_msg(&pubkey3, &init_b, msg_link_id, byz_pubkey)
+            .await;
+
+        // Byzantine node echoes hash_a — brings hash_a count to 2, still below threshold of 3
+        let echo_sig = byz_node.private_key.sign_echo(hash_a, msg_link_id);
+        let echo_msg = BroadcastRound::Echo(hash_a, echo_sig);
+        for pk in [&pubkey1, &pubkey2, &pubkey3] {
+            byz_node
+                .interface
+                .send_msg(pk, &echo_msg, msg_link_id, byz_pubkey)
+                .await;
+        }
+
+        let node1_clone = node1.clone();
+        let t1 = tokio::spawn(async move {
+            node1_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+
+        let node2_clone = node2.clone();
+        let t2 = tokio::spawn(async move {
+            node2_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+
+        let node3_clone = node3.clone();
+        let t3 = tokio::spawn(async move {
+            node3_clone
+                .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+
+        let result1 = t1.await.unwrap();
+        let result2 = t2.await.unwrap();
+        let result3 = t3.await.unwrap();
+
+        assert!(
+            matches!(result1, Err(BroadcastError::Timeout(TIMEOUT_SECS))),
+            "node1 should time out, got {:?}",
+            result1
+        );
+        assert!(
+            matches!(result2, Err(BroadcastError::Timeout(TIMEOUT_SECS))),
+            "node2 should time out, got {:?}",
+            result2
+        );
+        assert!(
+            matches!(result3, Err(BroadcastError::Timeout(TIMEOUT_SECS))),
+            "node3 should time out, got {:?}",
+            result3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_participant_times_out_waiting_for_init() {
+        // Init is never sent. The node subscribes and waits on an empty channel until the timeout fires.
+
+        const TIMEOUT_SECS: u64 = 1;
+        let node: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let msg_link_id = MsgLinkId::new(800);
+
+        let result = node
+            .participate_in_broadcast(msg_link_id, TIMEOUT_SECS)
+            .await;
+
+        assert!(
+            matches!(result, Err(BroadcastError::Timeout(TIMEOUT_SECS))),
+            "expected Timeout waiting for Init that never arrived, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initiator_times_out_when_no_echoes_return() {
+        // Verifies that broadcast_init times out when recipients never respond.
+
+        const TIMEOUT_SECS: u64 = 1;
+
+        let node0: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node3: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let pubkey0 = *node0.public_key();
+        let pubkey1 = *node1.public_key();
+        let pubkey2 = *node2.public_key();
+        let pubkey3 = *node3.public_key();
+
+        for node in [&node0, &node1, &node2, &node3] {
+            node.add_addr(pubkey0, node0.addr()).await;
+            node.add_addr(pubkey1, node1.addr()).await;
+            node.add_addr(pubkey2, node2.addr()).await;
+            node.add_addr(pubkey3, node3.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(900);
+        let participants = vec![pubkey0, pubkey1, pubkey2, pubkey3];
+
+        // Only the initiator participates so no echoes are ever sent back
+        let result = node0
+            .broadcast_init(participants, "hello".to_string(), msg_link_id, TIMEOUT_SECS)
+            .await;
+
+        assert!(
+            matches!(result, Err(BroadcastError::Timeout(TIMEOUT_SECS))),
+            "expected initiator to time out with no echoes returning, got {:?}",
+            result
+        );
     }
 }
