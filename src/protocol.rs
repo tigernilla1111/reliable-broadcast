@@ -219,9 +219,7 @@ impl<T: Data> ProtocolNode<T> {
         )
         .await
         .map_err(|_| BroadcastError::Timeout(timeout_secs))?;
-
-        drop(rx);
-
+        self.registry().deregister(msg_link_id).await;
         res
     }
 
@@ -248,8 +246,7 @@ impl<T: Data> ProtocolNode<T> {
         })
         .await
         .map_err(|_| BroadcastError::Timeout(timeout_secs))?;
-
-        drop(rx);
+        self.registry().deregister(msg_link_id).await;
         result
     }
 
@@ -1129,5 +1126,99 @@ mod tests {
             "expected initiator to time out with no echoes returning, got {:?}",
             result
         );
+    }
+    #[tokio::test]
+    async fn test_reuse_succeeds_after_deregister() {
+        // Verifies that a msg_link_id can be reused for a second broadcast after
+        // the first completes. On completion, deregister() removes the channel entry
+        // from the registry entirely. A subsequent subscribe() creates a fresh channel
+        const TIMEOUT_SECS: u64 = 5;
+
+        let node0: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node1: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node2: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+        let node3: Arc<ProtocolNode<String>> =
+            ProtocolNode::new("127.0.0.1:0", PrivateKey::new()).await;
+
+        let pubkey0 = *node0.public_key();
+        let pubkey1 = *node1.public_key();
+        let pubkey2 = *node2.public_key();
+        let pubkey3 = *node3.public_key();
+
+        for node in [&node0, &node1, &node2, &node3] {
+            node.add_addr(pubkey0, node0.addr()).await;
+            node.add_addr(pubkey1, node1.addr()).await;
+            node.add_addr(pubkey2, node2.addr()).await;
+            node.add_addr(pubkey3, node3.addr()).await;
+        }
+
+        let msg_link_id = MsgLinkId::new(1000);
+        let participants = vec![pubkey0, pubkey1, pubkey2, pubkey3];
+
+        // --- First broadcast ---
+        let n0 = node0.clone();
+        let n1 = node1.clone();
+        let n2 = node2.clone();
+        let n3 = node3.clone();
+        let p = participants.clone();
+
+        let t0 = tokio::spawn(async move {
+            n0.broadcast_init(p, "first".to_string(), msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+        let t1 =
+            tokio::spawn(
+                async move { n1.participate_in_broadcast(msg_link_id, TIMEOUT_SECS).await },
+            );
+        let t2 =
+            tokio::spawn(
+                async move { n2.participate_in_broadcast(msg_link_id, TIMEOUT_SECS).await },
+            );
+        let t3 =
+            tokio::spawn(
+                async move { n3.participate_in_broadcast(msg_link_id, TIMEOUT_SECS).await },
+            );
+
+        t0.await.unwrap().expect("first broadcast node0 failed");
+        t1.await.unwrap().expect("first broadcast node1 failed");
+        t2.await.unwrap().expect("first broadcast node2 failed");
+        t3.await.unwrap().expect("first broadcast node3 failed");
+
+        // --- Second broadcast with same msg_link_id ---
+        let n0 = node0.clone();
+        let n1 = node1.clone();
+        let n2 = node2.clone();
+        let n3 = node3.clone();
+        let p = participants.clone();
+
+        let t0 = tokio::spawn(async move {
+            n0.broadcast_init(p, "second".to_string(), msg_link_id, TIMEOUT_SECS)
+                .await
+        });
+        let t1 =
+            tokio::spawn(
+                async move { n1.participate_in_broadcast(msg_link_id, TIMEOUT_SECS).await },
+            );
+        let t2 =
+            tokio::spawn(
+                async move { n2.participate_in_broadcast(msg_link_id, TIMEOUT_SECS).await },
+            );
+        let t3 =
+            tokio::spawn(
+                async move { n3.participate_in_broadcast(msg_link_id, TIMEOUT_SECS).await },
+            );
+
+        let r0 = t0.await.unwrap().expect("second broadcast node0 failed");
+        let r1 = t1.await.unwrap().expect("second broadcast node1 failed");
+        let r2 = t2.await.unwrap().expect("second broadcast node2 failed");
+        let r3 = t3.await.unwrap().expect("second broadcast node3 failed");
+
+        assert_eq!(r0, "second");
+        assert_eq!(r1, "second");
+        assert_eq!(r2, "second");
+        assert_eq!(r3, "second");
     }
 }
