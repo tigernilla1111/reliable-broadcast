@@ -401,4 +401,25 @@ mod tests {
         assert_eq!(received.data.value, "hello");
         assert_eq!(received.sender, key1);
     }
+
+    #[tokio::test]
+    async fn test_deregister_allows_resubscribe() {
+        // Verifies that deregistering a msg_link_id removes the entry entirely,
+        // allowing a fresh subscribe on the same id to return a new receiver.
+        let registry = Registry::<TestData>::new();
+        let msg_link_id = MsgLinkId::new(3);
+
+        // First subscribe consumes the receiver
+        let first_rx = registry.subscribe(msg_link_id).await;
+        assert!(first_rx.is_some());
+
+        // Without deregister, a second subscribe returns None
+        let second_rx = registry.subscribe(msg_link_id).await;
+        assert!(second_rx.is_none());
+
+        // After deregister, subscribe creates a fresh channel
+        registry.deregister(msg_link_id).await;
+        let third_rx = registry.subscribe(msg_link_id).await;
+        assert!(third_rx.is_some());
+    }
 }
