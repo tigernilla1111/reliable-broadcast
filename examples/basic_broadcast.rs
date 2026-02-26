@@ -5,6 +5,8 @@ use reliable_broadcast::{crypto::PrivateKey, network::MsgLinkId, protocol::Proto
 use std::sync::Arc;
 use tokio::time::Duration;
 
+const PROTOCOL_TIMEOUT_SECS: u64 = 1;
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing for logs
@@ -61,7 +63,7 @@ async fn main() {
     let participants_clone = participants.clone();
     let initiator_task = tokio::spawn(async move {
         let result = node0_clone
-            .broadcast_init(participants_clone, data_clone, msg_link_id)
+            .broadcast_init(participants_clone, data_clone, msg_link_id, 1)
             .await;
         println!("Node 0: ✓ Delivered!");
         result
@@ -75,21 +77,27 @@ async fn main() {
     // Other nodes participate
     let node1_clone = node1.clone();
     let participant1_task = tokio::spawn(async move {
-        let result = node1_clone.participate_in_broadcast(msg_link_id).await;
+        let result = node1_clone
+            .participate_in_broadcast(msg_link_id, PROTOCOL_TIMEOUT_SECS)
+            .await;
         println!("Node 1: ✓ Delivered!");
         result
     });
 
     let node2_clone = node2.clone();
     let participant2_task = tokio::spawn(async move {
-        let result = node2_clone.participate_in_broadcast(msg_link_id).await;
+        let result = node2_clone
+            .participate_in_broadcast(msg_link_id, PROTOCOL_TIMEOUT_SECS)
+            .await;
         println!("Node 2: ✓ Delivered!");
         result
     });
 
     let node3_clone = node3.clone();
     let participant3_task = tokio::spawn(async move {
-        let result = node3_clone.participate_in_broadcast(msg_link_id).await;
+        let result = node3_clone
+            .participate_in_broadcast(msg_link_id, PROTOCOL_TIMEOUT_SECS)
+            .await;
         println!("Node 3: ✓ Delivered!");
         result
     });
