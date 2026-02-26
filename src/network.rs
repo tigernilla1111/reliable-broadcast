@@ -119,6 +119,10 @@ impl<T> Registry<T> {
             });
     }
 
+    pub async fn deregister(&self, msg_id: MsgLinkId) {
+        self.msg_channel_map.lock().await.remove(&msg_id);
+    }
+
     // Return and empty the stored rx channel. Note: this can only be done once
     pub async fn subscribe(&self, msg_id: MsgLinkId) -> Option<Receiver<MsgLink<T>>> {
         let mut inner = self.msg_channel_map.lock().await;
