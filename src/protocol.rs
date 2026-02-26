@@ -113,7 +113,7 @@ impl<T> BcastInstance<T> {
         *has_sent_ready = true;
     }
 
-    async fn count_echo(&mut self, hash: HashBytes, sender: PublicKeyBytes) {
+    fn count_echo(&mut self, hash: HashBytes, sender: PublicKeyBytes) {
         let num_hashes = self.hash_echo_count.entry(hash).or_insert(0);
         *num_hashes += 1;
         let count = *num_hashes;
@@ -124,7 +124,7 @@ impl<T> BcastInstance<T> {
         }
     }
 
-    async fn count_ready(&mut self, hash: HashBytes, sender: PublicKeyBytes) {
+    fn count_ready(&mut self, hash: HashBytes, sender: PublicKeyBytes) {
         let num_hashes = self.hash_ready_count.entry(hash).or_insert(0);
         *num_hashes += 1;
         let count = *num_hashes;
@@ -367,7 +367,7 @@ impl<T: Data> ProtocolNode<T> {
                     return;
                 }
 
-                bcast_instance.count_echo(init_hash.clone(), sender).await;
+                bcast_instance.count_echo(init_hash.clone(), sender);
                 if bcast_instance.echo_threshold_reached {
                     self.send_ready(bcast_instance, init_hash, msg_link_id)
                         .await;
@@ -401,7 +401,7 @@ impl<T: Data> ProtocolNode<T> {
                     return;
                 }
 
-                bcast_instance.count_ready(init_hash.clone(), sender).await;
+                bcast_instance.count_ready(init_hash.clone(), sender);
 
                 // Ready amplification: if we see f+1 Readys, we send our own
                 if bcast_instance.ready_amp_threshold_reached {
@@ -437,7 +437,7 @@ impl<T: Data> ProtocolNode<T> {
                 .send_msg(participant, &echo_msg, msg_link_id, self.public_key)
                 .await;
         }
-        bcast_instance.count_echo(hash, *self.public_key()).await;
+        bcast_instance.count_echo(hash, *self.public_key());
     }
 
     async fn send_ready(
@@ -463,7 +463,7 @@ impl<T: Data> ProtocolNode<T> {
                 .send_msg(participant, &rdy_msg, msg_link_id, self.public_key)
                 .await;
         }
-        bcast_instance.count_ready(hash, *self.public_key()).await;
+        bcast_instance.count_ready(hash, *self.public_key());
         bcast_instance.is_ready_msg_sent = true;
     }
 }
